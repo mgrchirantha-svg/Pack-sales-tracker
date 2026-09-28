@@ -131,7 +131,6 @@ else:
   total_bank_expenses = cursor.fetchone()[0]
 
   cash_on_hand = total_cash_collected - cash_drawer_to_bank_deposits
-  # Bank balance includes deposits minus bank expenses
   total_bank_balance = (
       sales_bank_deposits + total_standalone_deposits - total_bank_expenses
   )
@@ -261,24 +260,17 @@ with tab2:
 with tab3:
   st.subheader("Record Bank Account Expenses (Purchases)")
   with st.form("expense_form"):
-    exp_cat = st.selectbox(
-        "Expense Category",
-        [
-            "Inventory / Stock Purchase",
-            "Store Rent",
-            "Utilities & Bills",
-            "Transport / Logistics",
-            "Other Expense",
-        ],
-    )
+    # Replaced dropdown with a free text field for expense description
+    exp_desc = st.text_input("Expense Description / Note")
     exp_amt = st.number_input(
         "Amount (Rs.)", min_value=0.0, step=100.0, key="exp_amt_input"
     )
-    exp_notes = st.text_input("Notes / Vendor Name")
 
     exp_submitted = st.form_submit_button("Submit Expense")
     if exp_submitted:
-      if exp_amt <= 0:
+      if not exp_desc.strip():
+        st.error("Please enter a description for the expense.")
+      elif exp_amt <= 0:
         st.error("Please enter a valid expense amount.")
       else:
         cursor.execute(
@@ -286,7 +278,7 @@ with tab3:
                     INSERT INTO bank_expenses (expense_category, amount, notes)
                     VALUES (?, ?, ?)
                 """,
-            (exp_cat, exp_amt, exp_notes),
+            ("Bank Expense", exp_amt, exp_desc.strip()),
         )
         conn.commit()
         conn.sync()
@@ -295,8 +287,8 @@ with tab3:
 
   st.markdown("### Recent Bank Expenses History")
   cursor.execute(
-      "SELECT id, expense_category, amount, notes, timestamp FROM bank_expenses"
-      " ORDER BY id DESC LIMIT 10"
+      "SELECT id, notes, amount, timestamp FROM bank_expenses ORDER BY id DESC"
+      " LIMIT 10"
   )
   expense_data = cursor.fetchall()
   if expense_data:
@@ -304,10 +296,9 @@ with tab3:
         [
             {
                 "ID": r[0],
-                "Category": r[1],
+                "Expense Description": r[1],
                 "Amount": f"Rs. {r[2]:,.2f}",
-                "Notes": r[3] or "-",
-                "Date/Time": r[4],
+                "Date/Time": r[3],
             }
             for r in expense_data
         ]
