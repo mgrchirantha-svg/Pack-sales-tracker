@@ -74,8 +74,7 @@ st.markdown("Track packs, cash on hand, bank balances, and customer debts.")
 cursor.execute("""
     SELECT 
         (SELECT COALESCE(SUM(cash_payment), 0) FROM pack_sales) +
-        (SELECT COALESCE(SUM(borrow_amount), 0) FROM pack_borrows 
-    WHERE status = 'Paid')
+        (SELECT COALESCE(SUM(borrow_amount), 0) FROM pack_borrows WHERE status = 'Paid')
 """)
 total_cash_collected = cursor.fetchone()[0]
 
