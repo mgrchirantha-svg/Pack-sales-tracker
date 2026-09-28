@@ -30,20 +30,9 @@ cursor.execute("""
         pack_number INTEGER,
         cash_payment REAL,
         cash_deposit REAL,
-        deposit_method TEXT DEFAULT 'Cash Drawer',
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )
 """)
-
-# Safely add deposit_method column if an older table version exists in Turso
-try:
-  cursor.execute(
-      "ALTER TABLE pack_sales ADD COLUMN deposit_method TEXT DEFAULT 'Cash Drawer'"
-  )
-  conn.commit()
-except Exception:
-  pass  # Column already exists
-
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS pack_borrows (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,26 +82,14 @@ sales_bank_deposits = cursor.fetchone()[0]
 cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM bank_deposits")
 total_standalone_deposits = cursor.fetchone()[0]
 
-# Safe calculation handling potential missing column gracefully
-try:
-  cursor.execute("""
-        SELECT COALESCE(SUM(cash_deposit), 0) FROM pack_sales 
-        WHERE deposit_method = 'Cash Drawer'
-    """)
-  cash_drawer_deposits = cursor.fetchone()[0]
-except:
-  cash_drawer_deposits = sales_bank_deposits
-
+# Cash drawer is only reduced by standalone cash-on-hand bank deposits
 cursor.execute("""
     SELECT COALESCE(SUM(amount), 0) FROM bank_deposits 
     WHERE deposit_type LIKE '%Cash on Hand%'
 """)
-standalone_cash_drawer_deposits = cursor.fetchone()[0]
+cash_drawer_to_bank_deposits = cursor.fetchone()[0]
 
-total_cash_removed_from_drawer = (
-    cash_drawer_deposits + standalone_cash_drawer_deposits
-)
-cash_on_hand = total_cash_collected - total_cash_removed_from_drawer
+cash_on_hand = total_cash_collected - cash_drawer_to_bank_deposits
 total_bank_balance = sales_bank_deposits + total_standalone_deposits
 
 col1, col2 = st.columns(2)
@@ -138,23 +115,10 @@ with tab1:
       "Cash Payment Received (Rs.)", min_value=0.0, step=10.0, key="cash_pay_in"
   )
   bank_dep = st.number_input(
-      "Bank Deposit Amount with this sale (Rs.)",
+      "Direct Customer Bank Transfer Amount (Rs.)",
       min_value=0.0,
       step=10.0,
       key="bank_dep_in",
-  )
-
-  dep_method = st.selectbox(
-      "Bank Deposit Source / Method",
-      [
-          "Bank Transfer (Direct from customer - does not reduce cash drawer)",
-          "Cash Drawer (Physical cash taken from drawer to deposit)",
-      ],
-      key="dep_method_select",
-  )
-
-  method_db = (
-      "Bank Transfer" if "Bank Transfer" in dep_method else "Cash Drawer"
   )
 
   st.markdown("### Add Borrowers for This Pack")
@@ -184,10 +148,10 @@ with tab1:
   if st.button("Save Pack & Move to Next", type="primary"):
     cursor.execute(
         """
-            INSERT INTO pack_sales (pack_number, cash_payment, cash_deposit, deposit_method)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO pack_sales (pack_number, cash_payment, cash_deposit)
+            VALUES (?, ?, ?)
         """,
-        (current_pack, cash_pay, bank_dep, method_db),
+        (current_pack, cash_pay, bank_dep),
     )
     sale_id = cursor.lastrowid
 
