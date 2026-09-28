@@ -60,15 +60,9 @@ try:
 except:
   pass
 
-# Initialize session state for temporary multi-borrowers list & form fields
+# Initialize session state for temporary multi-borrowers list
 if "temp_borrowers" not in st.session_state:
   st.session_state.temp_borrowers = []
-
-if "cash_pay_val" not in st.session_state:
-  st.session_state.cash_pay_val = 0.0
-
-if "bank_dep_val" not in st.session_state:
-  st.session_state.bank_dep_val = 0.0
 
 # --- DASHBOARD HEADER ---
 st.title("🍾 Bottle Shop Web Dashboard")
@@ -117,17 +111,12 @@ with tab1:
   st.subheader(f"Recording Pack: {current_pack} of 10")
 
   cash_pay = st.number_input(
-      "Cash Payment Received (Rs.)",
-      min_value=0.0,
-      step=10.0,
-      value=st.session_state.cash_pay_val,
-      key="cash_pay_in",
+      "Cash Payment Received (Rs.)", min_value=0.0, step=10.0, key="cash_pay_in"
   )
   bank_dep = st.number_input(
       "Direct Customer Bank Transfer Amount (Rs.)",
       min_value=0.0,
       step=10.0,
-      value=st.session_state.bank_dep_val,
       key="bank_dep_in",
   )
 
@@ -180,17 +169,7 @@ with tab1:
     # Clear borrower queue
     st.session_state.temp_borrowers = []
 
-    # FORCE the widget keys themselves to 0.0 so they reset on screen
-    st.session_state["cash_pay_in"] = 0.0
-    st.session_state["bank_dep_in"] = 0.0
-
-    st.success(f"Pack {current_pack} saved and synced successfully!")
-    st.rerun()
-    # Clear session values and widget memory completely
-    st.session_state.temp_borrowers = []
-    st.session_state.cash_pay_val = 0.0
-    st.session_state.bank_dep_val = 0.0
-
+    # Reset input fields on screen by deleting their keys from session state
     if "cash_pay_in" in st.session_state:
       del st.session_state["cash_pay_in"]
     if "bank_dep_in" in st.session_state:
