@@ -60,9 +60,12 @@ try:
 except:
   pass
 
-# Initialize session state for temporary multi-borrowers list & authentication
+# Initialize session state variables
 if "temp_borrowers" not in st.session_state:
   st.session_state.temp_borrowers = []
+
+if "show_password_prompt" not in st.session_state:
+  st.session_state.show_password_prompt = False
 
 if "authenticated" not in st.session_state:
   st.session_state.authenticated = False
@@ -71,52 +74,56 @@ if "authenticated" not in st.session_state:
 st.title("🍾 Bottle Shop Web Dashboard")
 st.markdown("Track packs, cash on hand, bank balances, and customer debts.")
 
-# --- SECURE FINANCIAL METRICS SUMMARY ---
-with st.expander("🔒 View Financial Summary (Password Required)", expanded=False):
-  if not st.session_state.authenticated:
-    entered_password = st.text_input(
-        "Enter Dashboard Password", type="password", key="pwd_input"
+# --- SECURE FINANCIAL BALANCES SECTION ---
+if not st.session_state.authenticated:
+  if st.button("🔒 Click to View Cash & Bank Balances"):
+    st.session_state.show_password_prompt = (
+        not st.session_state.show_password_prompt
     )
-    if st.button("Unlock Balances"):
-      # Use password from Streamlit secrets if available, else default to 'admin123'
-      correct_password = st.secrets.get("DASHBOARD_PASSWORD", "admin123")
-      if entered_password == correct_password:
+
+  if st.session_state.show_password_prompt:
+    entered_pwd = st.text_input(
+        "Enter Dashboard Password", type="password", key="header_pwd_input"
+    )
+    if st.button("Unlock"):
+      correct_pwd = st.secrets.get("DASHBOARD_PASSWORD", "admin123")
+      if entered_pwd == correct_pwd:
         st.session_state.authenticated = True
-        st.success("Unlocked successfully!")
+        st.session_state.show_password_prompt = False
         st.rerun()
       else:
-        st.error("Incorrect password! Please try again.")
-  else:
-    if st.button("Lock Balances"):
-      st.session_state.authenticated = False
-      st.rerun()
+        st.error("Incorrect password!")
+else:
+  if st.button("🔒 Lock Balances"):
+    st.session_state.authenticated = False
+    st.rerun()
 
-    # Calculate metrics only when unlocked
-    cursor.execute("""
-            SELECT 
-                (SELECT COALESCE(SUM(cash_payment), 0) FROM pack_sales) +
-                (SELECT COALESCE(SUM(borrow_amount), 0) FROM pack_borrows WHERE status = 'Paid')
-        """)
-    total_cash_collected = cursor.fetchone()[0]
+  # Calculate and display balances only when unlocked
+  cursor.execute("""
+        SELECT 
+            (SELECT COALESCE(SUM(cash_payment), 0) FROM pack_sales) +
+            (SELECT COALESCE(SUM(borrow_amount), 0) FROM pack_borrows WHERE status = 'Paid')
+    """)
+  total_cash_collected = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COALESCE(SUM(cash_deposit), 0) FROM pack_sales")
-    sales_bank_deposits = cursor.fetchone()[0]
+  cursor.execute("SELECT COALESCE(SUM(cash_deposit), 0) FROM pack_sales")
+  sales_bank_deposits = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM bank_deposits")
-    total_standalone_deposits = cursor.fetchone()[0]
+  cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM bank_deposits")
+  total_standalone_deposits = cursor.fetchone()[0]
 
-    cursor.execute("""
-            SELECT COALESCE(SUM(amount), 0) FROM bank_deposits 
-            WHERE deposit_type LIKE '%Cash on Hand%'
-        """)
-    cash_drawer_to_bank_deposits = cursor.fetchone()[0]
+  cursor.execute("""
+        SELECT COALESCE(SUM(amount), 0) FROM bank_deposits 
+        WHERE deposit_type LIKE '%Cash on Hand%'
+    """)
+  cash_drawer_to_bank_deposits = cursor.fetchone()[0]
 
-    cash_on_hand = total_cash_collected - cash_drawer_to_bank_deposits
-    total_bank_balance = sales_bank_deposits + total_standalone_deposits
+  cash_on_hand = total_cash_collected - cash_drawer_to_bank_deposits
+  total_bank_balance = sales_bank_deposits + total_standalone_deposits
 
-    col1, col2 = st.columns(2)
-    col1.metric("💵 Cash on Hand", f"Rs. {cash_on_hand:,.2f}")
-    col2.metric("🏦 Bank Account Balance", f"Rs. {total_bank_balance:,.2f}")
+  col1, col2 = st.columns(2)
+  col1.metric("💵 Cash on Hand", f"Rs. {cash_on_hand:,.2f}")
+  col2.metric("🏦 Bank Account Balance", f"Rs. {total_bank_balance:,.2f}")
 
 st.divider()
 
@@ -189,6 +196,7 @@ with tab1:
     conn.commit()
     conn.sync()
 
+    # Clear borrower queue and force reset input fields to zero
     st.session_state.temp_borrowers = []
     if "cash_pay_in" in st.session_state:
       del st.session_state["cash_pay_in"]
