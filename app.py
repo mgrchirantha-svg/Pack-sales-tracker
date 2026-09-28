@@ -177,6 +177,15 @@ with tab1:
     conn.commit()
     conn.sync()
 
+    # Clear borrower queue
+    st.session_state.temp_borrowers = []
+
+    # FORCE the widget keys themselves to 0.0 so they reset on screen
+    st.session_state["cash_pay_in"] = 0.0
+    st.session_state["bank_dep_in"] = 0.0
+
+    st.success(f"Pack {current_pack} saved and synced successfully!")
+    st.rerun()
     # Clear session values and widget memory completely
     st.session_state.temp_borrowers = []
     st.session_state.cash_pay_val = 0.0
