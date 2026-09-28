@@ -60,9 +60,15 @@ try:
 except:
   pass
 
-# Initialize session state for temporary multi-borrowers list
+# Initialize session state for temporary multi-borrowers list & form fields
 if "temp_borrowers" not in st.session_state:
   st.session_state.temp_borrowers = []
+
+if "cash_pay_val" not in st.session_state:
+  st.session_state.cash_pay_val = 0.0
+
+if "bank_dep_val" not in st.session_state:
+  st.session_state.bank_dep_val = 0.0
 
 # --- DASHBOARD HEADER ---
 st.title("🍾 Bottle Shop Web Dashboard")
@@ -82,7 +88,6 @@ sales_bank_deposits = cursor.fetchone()[0]
 cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM bank_deposits")
 total_standalone_deposits = cursor.fetchone()[0]
 
-# Cash drawer is only reduced by standalone cash-on-hand bank deposits
 cursor.execute("""
     SELECT COALESCE(SUM(amount), 0) FROM bank_deposits 
     WHERE deposit_type LIKE '%Cash on Hand%'
@@ -112,12 +117,17 @@ with tab1:
   st.subheader(f"Recording Pack: {current_pack} of 10")
 
   cash_pay = st.number_input(
-      "Cash Payment Received (Rs.)", min_value=0.0, step=10.0, key="cash_pay_in"
+      "Cash Payment Received (Rs.)",
+      min_value=0.0,
+      step=10.0,
+      value=st.session_state.cash_pay_val,
+      key="cash_pay_in",
   )
   bank_dep = st.number_input(
       "Direct Customer Bank Transfer Amount (Rs.)",
       min_value=0.0,
       step=10.0,
+      value=st.session_state.bank_dep_val,
       key="bank_dep_in",
   )
 
@@ -166,7 +176,12 @@ with tab1:
 
     conn.commit()
     conn.sync()
+
+    # Reset form fields and borrower queue back to zero/empty
     st.session_state.temp_borrowers = []
+    st.session_state.cash_pay_val = 0.0
+    st.session_state.bank_dep_val = 0.0
+
     st.success(f"Pack {current_pack} saved and synced successfully!")
     st.rerun()
 
