@@ -13,7 +13,6 @@ TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTA1
 
 @st.cache_resource
 def get_connection():
-  # Use /tmp/ directory which is writable on Streamlit Cloud
   conn = libsql.connect(
       "/tmp/bottle_sales.db", sync_url=TURSO_URL, auth_token=TURSO_TOKEN
   )
@@ -24,7 +23,7 @@ def get_connection():
 conn = get_connection()
 cursor = conn.cursor()
 
-# Ensure tables exist (adding deposit_method column safely if missing)
+# Ensure tables exist
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS pack_sales (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,6 +34,16 @@ cursor.execute("""
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )
 """)
+
+# Safely add deposit_method column if an older table version exists in Turso
+try:
+  cursor.execute(
+      "ALTER TABLE pack_sales ADD COLUMN deposit_method TEXT DEFAULT 'Cash Drawer'"
+  )
+  conn.commit()
+except Exception:
+  pass  # Column already exists
+
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS pack_borrows (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,12 +93,15 @@ sales_bank_deposits = cursor.fetchone()[0]
 cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM bank_deposits")
 total_standalone_deposits = cursor.fetchone()[0]
 
-# Only deduct cash-drawer-based bank deposits from cash on hand
-cursor.execute("""
-    SELECT COALESCE(SUM(cash_deposit), 0) FROM pack_sales 
-    WHERE deposit_method = 'Cash Drawer'
-""")
-cash_drawer_deposits = cursor.fetchone()[0]
+# Safe calculation handling potential missing column gracefully
+try:
+  cursor.execute("""
+        SELECT COALESCE(SUM(cash_deposit), 0) FROM pack_sales 
+        WHERE deposit_method = 'Cash Drawer'
+    """)
+  cash_drawer_deposits = cursor.fetchone()[0]
+except:
+  cash_drawer_deposits = sales_bank_deposits
 
 cursor.execute("""
     SELECT COALESCE(SUM(amount), 0) FROM bank_deposits 
@@ -100,7 +112,6 @@ standalone_cash_drawer_deposits = cursor.fetchone()[0]
 total_cash_removed_from_drawer = (
     cash_drawer_deposits + standalone_cash_drawer_deposits
 )
-
 cash_on_hand = total_cash_collected - total_cash_removed_from_drawer
 total_bank_balance = sales_bank_deposits + total_standalone_deposits
 
@@ -133,7 +144,6 @@ with tab1:
       key="bank_dep_in",
   )
 
-  # NEW: Option to specify how the bank deposit was funded
   dep_method = st.selectbox(
       "Bank Deposit Source / Method",
       [
@@ -143,7 +153,6 @@ with tab1:
       key="dep_method_select",
   )
 
-  # Convert selection to clean storage value
   method_db = (
       "Bank Transfer" if "Bank Transfer" in dep_method else "Cash Drawer"
   )
@@ -163,7 +172,6 @@ with tab1:
     else:
       st.error("Please enter a valid borrower name and amount.")
 
-  # Display current queue of borrowers added to this pack
   if st.session_state.temp_borrowers:
     st.markdown("**Queue of Borrowers for This Pack:**")
     for idx, b in enumerate(st.session_state.temp_borrowers):
@@ -174,15 +182,6 @@ with tab1:
         st.rerun()
 
   if st.button("Save Pack & Move to Next", type="primary"):
-    # Check if table has deposit_method column, add dynamically if needed
-    try:
-      cursor.execute(
-          "ALTER TABLE pack_sales ADD COLUMN deposit_method TEXT DEFAULT 'Cash Drawer'"
-      )
-      conn.commit()
-    except:
-      pass
-
     cursor.execute(
         """
             INSERT INTO pack_sales (pack_number, cash_payment, cash_deposit, deposit_method)
@@ -192,7 +191,6 @@ with tab1:
     )
     sale_id = cursor.lastrowid
 
-    # Insert all queued borrowers into Turso
     for b in st.session_state.temp_borrowers:
       cursor.execute(
           """
@@ -204,7 +202,7 @@ with tab1:
 
     conn.commit()
     conn.sync()
-    st.session_state.temp_borrowers = []  # Clear temporary queue
+    st.session_state.temp_borrowers = []
     st.success(f"Pack {current_pack} saved and synced successfully!")
     st.rerun()
 
