@@ -61,6 +61,10 @@ try:
 except:
   pass
 
+# Initialize session state for temporary multi-borrowers list
+if "temp_borrowers" not in st.session_state:
+  st.session_state.temp_borrowers = []
+
 # --- DASHBOARD HEADER ---
 st.title("🍾 Bottle Shop Web Dashboard")
 st.markdown("Track packs, cash on hand, bank balances, and customer debts.")
@@ -109,44 +113,66 @@ current_pack = (row[0] % 10) + 1 if row else 1
 with tab1:
   st.subheader(f"Recording Pack: {current_pack} of 10")
 
-  with st.form("sales_form"):
-    cash_pay = st.number_input(
-        "Cash Payment Received (Rs.)", min_value=0.0, step=10.0
-    )
-    bank_dep = st.number_input(
-        "Cash Deposit to Bank with this sale (Rs.)", min_value=0.0, step=10.0
-    )
+  cash_pay = st.number_input(
+      "Cash Payment Received (Rs.)", min_value=0.0, step=10.0, key="cash_pay_in"
+  )
+  bank_dep = st.number_input(
+      "Cash Deposit to Bank with this sale (Rs.)",
+      min_value=0.0,
+      step=10.0,
+      key="bank_dep_in",
+  )
 
-    st.markdown("### Add Borrowers (Optional)")
-    b_name = st.text_input("Borrower Name")
-    b_amt = st.number_input(
-        "Borrow Amount (Rs.)", min_value=0.0, step=10.0, key="b_amt_input"
-    )
+  st.markdown("### Add Borrowers for This Pack")
+  b_name = st.text_input("Borrower Name", key="b_name_input")
+  b_amt = st.number_input(
+      "Borrow Amount (Rs.)", min_value=0.0, step=10.0, key="b_amt_input"
+  )
 
-    submitted = st.form_submit_button("Save Pack & Move to Next")
-    if submitted:
+  if st.button("+ Add Borrower to List"):
+    if b_name.strip() and b_amt > 0:
+      st.session_state.temp_borrowers.append(
+          {"name": b_name.strip(), "amount": b_amt}
+      )
+      st.success(f"Added {b_name.strip()} (Rs. {b_amt:,.2f}) to this pack.")
+    else:
+      st.error("Please enter a valid borrower name and amount.")
+
+  # Display current queue of borrowers added to this pack
+  if st.session_state.temp_borrowers:
+    st.markdown("**Queue of Borrowers for This Pack:**")
+    for idx, b in enumerate(st.session_state.temp_borrowers):
+      col_a, col_b = st.columns([4, 1])
+      col_a.text(f"{b['name']} : Rs. {b['amount']:,.2f}")
+      if col_b.button("Remove", key=f"rm_borrower_{idx}"):
+        st.session_state.temp_borrowers.pop(idx)
+        st.rerun()
+
+  if st.button("Save Pack & Move to Next", type="primary"):
+    cursor.execute(
+        """
+            INSERT INTO pack_sales (pack_number, cash_payment, cash_deposit)
+            VALUES (?, ?, ?)
+        """,
+        (current_pack, cash_pay, bank_dep),
+    )
+    sale_id = cursor.lastrowid
+
+    # Insert all queued borrowers into Turso
+    for b in st.session_state.temp_borrowers:
       cursor.execute(
           """
-                INSERT INTO pack_sales (pack_number, cash_payment, cash_deposit)
-                VALUES (?, ?, ?)
+                INSERT INTO pack_borrows (sale_id, borrower_name, borrow_amount, status)
+                VALUES (?, ?, ?, 'Pending')
             """,
-          (current_pack, cash_pay, bank_dep),
+          (sale_id, b["name"], b["amount"]),
       )
-      sale_id = cursor.lastrowid
 
-      if b_name.strip() and b_amt > 0:
-        cursor.execute(
-            """
-                    INSERT INTO pack_borrows (sale_id, borrower_name, borrow_amount, status)
-                    VALUES (?, ?, ?, 'Pending')
-                """,
-            (sale_id, b_name.strip(), b_amt),
-        )
-
-      conn.commit()
-      conn.sync()
-      st.success(f"Pack {current_pack} saved successfully!")
-      st.rerun()
+    conn.commit()
+    conn.sync()
+    st.session_state.temp_borrowers = []  # Clear temporary queue
+    st.success(f"Pack {current_pack} saved and synced successfully!")
+    st.rerun()
 
 with tab2:
   st.subheader("Make Standalone Bank Deposits")
