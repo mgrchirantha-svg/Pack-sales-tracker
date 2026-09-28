@@ -13,8 +13,9 @@ TURSO_TOKEN = "your-turso-auth-token-string-here"
 
 @st.cache_resource
 def get_connection():
+  # Use /tmp/ directory which is writable on Streamlit Cloud
   conn = libsql.connect(
-      "bottle_sales.db", sync_url=TURSO_URL, auth_token=TURSO_TOKEN
+      "/tmp/bottle_sales.db", sync_url=TURSO_URL, auth_token=TURSO_TOKEN
   )
   conn.sync()
   return conn
