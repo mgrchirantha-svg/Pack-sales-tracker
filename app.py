@@ -177,10 +177,15 @@ with tab1:
     conn.commit()
     conn.sync()
 
-    # Reset form fields and borrower queue back to zero/empty
+    # Clear session values and widget memory completely
     st.session_state.temp_borrowers = []
     st.session_state.cash_pay_val = 0.0
     st.session_state.bank_dep_val = 0.0
+
+    if "cash_pay_in" in st.session_state:
+      del st.session_state["cash_pay_in"]
+    if "bank_dep_in" in st.session_state:
+      del st.session_state["bank_dep_in"]
 
     st.success(f"Pack {current_pack} saved and synced successfully!")
     st.rerun()
