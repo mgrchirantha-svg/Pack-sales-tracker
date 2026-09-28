@@ -7,8 +7,8 @@ st.set_page_config(
 )
 
 # --- TURSO CLOUD CONNECTION ---
-TURSO_URL = "libsql://your-database-name.turso.io"
-TURSO_TOKEN = "your-turso-auth-token-string-here"
+TURSO_URL = "libsql://pack-sales-record-chirantha.aws-ap-south-1.turso.io"
+TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTA1Nzk1NTAsImlkIjoiMDFhMGU2N2ItMmEwMS03MjFjLWJhNTYtMTI2MTMwY2VlNDA5Iiwia2lkIjoiZ3dhSGsyaTV0TXlMWDRWS05KQ1BzQkx2Z01abFpNOG5yOFVVUmhmdzBKWSIsInJpZCI6IjcwMTUxZjI3LTlhZWItNDQzNS04NDZiLWJlMWU4MjQwMjk0NiJ9.UivYy_canij3-i5YvPsdujnIrxkc0nEcjNNf69q8ucCZLi2ZGTNU6QOJstTIua4bOCsYtDYLglU7Zttv0sYtDQ"
 
 
 @st.cache_resource
