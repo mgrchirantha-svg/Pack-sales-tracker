@@ -52,6 +52,15 @@ cursor.execute("""
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )
 """)
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS bank_expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        expense_category TEXT,
+        amount REAL,
+        notes TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+""")
 conn.commit()
 
 # Sync latest cloud data
@@ -118,8 +127,14 @@ else:
     """)
   cash_drawer_to_bank_deposits = cursor.fetchone()[0]
 
+  cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM bank_expenses")
+  total_bank_expenses = cursor.fetchone()[0]
+
   cash_on_hand = total_cash_collected - cash_drawer_to_bank_deposits
-  total_bank_balance = sales_bank_deposits + total_standalone_deposits
+  # Bank balance includes deposits minus bank expenses
+  total_bank_balance = (
+      sales_bank_deposits + total_standalone_deposits - total_bank_expenses
+  )
 
   col1, col2 = st.columns(2)
   col1.metric("💵 Cash on Hand", f"Rs. {cash_on_hand:,.2f}")
@@ -128,8 +143,14 @@ else:
 st.divider()
 
 # --- TABS FOR WEB APP ACTIONS ---
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📦 Record Sales", "🏦 Bank Deposits", "⚠️ Manage Debts", "📊 Sales History"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    [
+        "📦 Record Sales",
+        "🏦 Bank Deposits",
+        "💸 Bank Expenses",
+        "⚠️ Manage Debts",
+        "📊 Sales History",
+    ]
 )
 
 # Determine current pack state
@@ -196,7 +217,6 @@ with tab1:
     conn.commit()
     conn.sync()
 
-    # Clear borrower queue and force reset input fields to zero
     st.session_state.temp_borrowers = []
     if "cash_pay_in" in st.session_state:
       del st.session_state["cash_pay_in"]
@@ -239,6 +259,63 @@ with tab2:
         st.rerun()
 
 with tab3:
+  st.subheader("Record Bank Account Expenses (Purchases)")
+  with st.form("expense_form"):
+    exp_cat = st.selectbox(
+        "Expense Category",
+        [
+            "Inventory / Stock Purchase",
+            "Store Rent",
+            "Utilities & Bills",
+            "Transport / Logistics",
+            "Other Expense",
+        ],
+    )
+    exp_amt = st.number_input(
+        "Amount (Rs.)", min_value=0.0, step=100.0, key="exp_amt_input"
+    )
+    exp_notes = st.text_input("Notes / Vendor Name")
+
+    exp_submitted = st.form_submit_button("Submit Expense")
+    if exp_submitted:
+      if exp_amt <= 0:
+        st.error("Please enter a valid expense amount.")
+      else:
+        cursor.execute(
+            """
+                    INSERT INTO bank_expenses (expense_category, amount, notes)
+                    VALUES (?, ?, ?)
+                """,
+            (exp_cat, exp_amt, exp_notes),
+        )
+        conn.commit()
+        conn.sync()
+        st.success("Bank expense recorded and balance updated!")
+        st.rerun()
+
+  st.markdown("### Recent Bank Expenses History")
+  cursor.execute(
+      "SELECT id, expense_category, amount, notes, timestamp FROM bank_expenses"
+      " ORDER BY id DESC LIMIT 10"
+  )
+  expense_data = cursor.fetchall()
+  if expense_data:
+    st.table(
+        [
+            {
+                "ID": r[0],
+                "Category": r[1],
+                "Amount": f"Rs. {r[2]:,.2f}",
+                "Notes": r[3] or "-",
+                "Date/Time": r[4],
+            }
+            for r in expense_data
+        ]
+    )
+  else:
+    st.info("No bank expenses recorded yet.")
+
+with tab4:
   st.subheader("Outstanding Customer Borrows")
   cursor.execute("""
         SELECT pb.id, ps.pack_number, pb.borrower_name, pb.borrow_amount 
@@ -266,7 +343,7 @@ with tab3:
   else:
     st.info("No pending customer debts found.")
 
-with tab4:
+with tab5:
   st.subheader("Sales History")
   cursor.execute("""
         SELECT 
