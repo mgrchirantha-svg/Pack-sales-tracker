@@ -1,0 +1,241 @@
+import libsql
+import streamlit as st
+
+# Page Configuration
+st.set_page_config(
+    page_title="Bottle Shop Dashboard", page_icon="🍾", layout="wide"
+)
+
+# --- TURSO CLOUD CONNECTION ---
+TURSO_URL = "libsql://your-database-name.turso.io"
+TURSO_TOKEN = "your-turso-auth-token-string-here"
+
+
+@st.cache_resource
+def get_connection():
+  conn = libsql.connect(
+      "bottle_sales.db", sync_url=TURSO_URL, auth_token=TURSO_TOKEN
+  )
+  conn.sync()
+  return conn
+
+
+conn = get_connection()
+cursor = conn.cursor()
+
+# Ensure tables exist
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS pack_sales (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pack_number INTEGER,
+        cash_payment REAL,
+        cash_deposit REAL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS pack_borrows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sale_id INTEGER,
+        borrower_name TEXT,
+        borrow_amount REAL,
+        status TEXT DEFAULT 'Pending',
+        FOREIGN KEY(sale_id) REFERENCES pack_sales(id)
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS bank_deposits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        deposit_type TEXT,
+        amount REAL,
+        notes TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+conn.commit()
+
+# Sync latest cloud data
+try:
+  conn.sync()
+except:
+  pass
+
+# --- DASHBOARD HEADER ---
+st.title("🍾 Bottle Shop Web Dashboard")
+st.markdown("Track packs, cash on hand, bank balances, and customer debts.")
+
+# --- FINANCIAL METRICS SUMMARY ---
+cursor.execute("""
+    SELECT 
+        (SELECT COALESCE(SUM(cash_payment), 0) FROM pack_sales) +
+        (SELECT COALESCE(SUM(borrow_amount), 0) FROM pack_borrows WHERE status = 'Paid')
+""")
+total_cash_collected = cursor.fetchone()[0]
+
+cursor.execute("SELECT COALESCE(SUM(cash_deposit), 0) FROM pack_sales")
+sales_bank_deposits = cursor.fetchone()[0]
+
+cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM bank_deposits")
+total_standalone_deposits = cursor.fetchone()[0]
+
+cursor.execute(
+    "SELECT COALESCE(SUM(amount), 0) FROM bank_deposits WHERE deposit_type LIKE"
+    " '%Cash on Hand%'"
+)
+cash_on_hand_deposits = cursor.fetchone()[0]
+
+cash_on_hand = (
+    total_cash_collected - sales_bank_deposits - cash_on_hand_deposits
+)
+total_bank_balance = sales_bank_deposits + total_standalone_deposits
+
+col1, col2 = st.columns(2)
+col1.metric("💵 Cash on Hand", f"Rs. {cash_on_hand:,.2f}")
+col2.metric("🏦 Bank Account Balance", f"Rs. {total_bank_balance:,.2f}")
+
+st.divider()
+
+# --- TABS FOR WEB APP ACTIONS ---
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📦 Record Sales", "🏦 Bank Deposits", "⚠️ Manage Debts", "📊 Sales History"]
+)
+
+# Determine current pack state
+cursor.execute("SELECT pack_number FROM pack_sales ORDER BY id DESC LIMIT 1")
+row = cursor.fetchone()
+current_pack = (row[0] % 10) + 1 if row else 1
+
+with tab1:
+  st.subheader(f"Recording Pack: {current_pack} of 10")
+
+  with st.form("sales_form"):
+    cash_pay = st.number_input(
+        "Cash Payment Received (Rs.)", min_value=0.0, step=10.0
+    )
+    bank_dep = st.number_input(
+        "Cash Deposit to Bank with this sale (Rs.)", min_value=0.0, step=10.0
+    )
+
+    st.markdown("### Add Borrowers (Optional)")
+    b_name = st.text_input("Borrower Name")
+    b_amt = st.number_input(
+        "Borrow Amount (Rs.)", min_value=0.0, step=10.0, key="b_amt_input"
+    )
+
+    submitted = st.form_submit_button("Save Pack & Move to Next")
+    if submitted:
+      cursor.execute(
+          """
+                INSERT INTO pack_sales (pack_number, cash_payment, cash_deposit)
+                VALUES (?, ?, ?)
+            """,
+          (current_pack, cash_pay, bank_dep),
+      )
+      sale_id = cursor.lastrowid
+
+      if b_name.strip() and b_amt > 0:
+        cursor.execute(
+            """
+                    INSERT INTO pack_borrows (sale_id, borrower_name, borrow_amount, status)
+                    VALUES (?, ?, ?, 'Pending')
+                """,
+            (sale_id, b_name.strip(), b_amt),
+        )
+
+      conn.commit()
+      conn.sync()
+      st.success(f"Pack {current_pack} saved successfully!")
+      st.rerun()
+
+with tab2:
+  st.subheader("Make Standalone Bank Deposits")
+  with st.form("bank_form"):
+    dep_type = st.selectbox(
+        "Deposit Type",
+        [
+            "Deposit Cash on Hand to Bank",
+            "Personal Money Investment to Bank",
+        ],
+    )
+    dep_amt = st.number_input(
+        "Amount (Rs.)", min_value=0.0, step=100.0, key="bank_amt"
+    )
+    dep_notes = st.text_input("Notes / Description")
+
+    bank_submitted = st.form_submit_button("Submit Deposit")
+    if bank_submitted:
+      if dep_amt <= 0:
+        st.error("Please enter a valid amount.")
+      else:
+        cursor.execute(
+            """
+                    INSERT INTO bank_deposits (deposit_type, amount, notes)
+                    VALUES (?, ?, ?)
+                """,
+            (dep_type, dep_amt, dep_notes),
+        )
+        conn.commit()
+        conn.sync()
+        st.success("Bank deposit recorded and synced!")
+        st.rerun()
+
+with tab3:
+  st.subheader("Outstanding Customer Borrows")
+  cursor.execute("""
+        SELECT pb.id, ps.pack_number, pb.borrower_name, pb.borrow_amount 
+        FROM pack_borrows pb
+        JOIN pack_sales ps ON pb.sale_id = ps.id
+        WHERE pb.status = 'Pending'
+    """)
+  pending_debts = cursor.fetchall()
+
+  if pending_debts:
+    for debt in pending_debts:
+      d_id, pack_no, borrower, amount = debt
+      cols = st.columns([3, 2, 2, 2])
+      cols[0].text(f"Customer: {borrower}")
+      cols[1].text(f"Pack #{pack_no}")
+      cols[2].text(f"Rs. {amount:,.2f}")
+      if cols[3].button("Mark Paid", key=f"pay_{d_id}"):
+        cursor.execute(
+            "UPDATE pack_borrows SET status = 'Paid' WHERE id = ?", (d_id,)
+        )
+        conn.commit()
+        conn.sync()
+        st.success(f"Cleared debt for {borrower}!")
+        st.rerun()
+  else:
+    st.info("No pending customer debts found.")
+
+with tab4:
+  st.subheader("Sales History")
+  cursor.execute("""
+        SELECT 
+            ps.id, 
+            ps.pack_number, 
+            (ps.cash_payment + COALESCE(SUM(CASE WHEN pb.status = 'Paid' THEN pb.borrow_amount ELSE 0 END), 0)),
+            ps.cash_deposit,
+            COALESCE(SUM(CASE WHEN pb.status = 'Pending' THEN pb.borrow_amount ELSE 0 END), 0),
+            (ps.cash_payment + COALESCE(SUM(CASE WHEN pb.status = 'Paid' THEN pb.borrow_amount ELSE 0 END), 0) + ps.cash_deposit)
+        FROM pack_sales ps
+        LEFT JOIN pack_borrows pb ON ps.id = pb.sale_id
+        GROUP BY ps.id
+        ORDER BY ps.id DESC
+    """)
+  history_data = cursor.fetchall()
+  if history_data:
+    st.table(
+        [
+            {
+                "Sale ID": r[0],
+                "Pack #": r[1],
+                "Cash Payment": f"Rs. {r[2]:,.2f}",
+                "Bank Deposit": f"Rs. {r[3]:,.2f}",
+                "Money to Receive": f"Rs. {r[4]:,.2f}",
+                "Total Received": f"Rs. {r[5]:,.2f}",
+            }
+            for r in history_data
+        ]
+    )
+  else:
+    st.info("No sales recorded yet.")
