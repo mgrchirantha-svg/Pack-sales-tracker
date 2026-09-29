@@ -3,7 +3,7 @@ import streamlit as st
 
 # Page Configuration
 st.set_page_config(
-    page_title="Bottle Shop Dashboard", page_icon="🍾", layout="wide"
+    page_title="Dashboard", page_icon="🚬", layout="wide"
 )
 
 # --- TURSO CLOUD CONNECTION ---
