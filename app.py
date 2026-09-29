@@ -23,7 +23,7 @@ def get_connection():
 conn = get_connection()
 cursor = conn.cursor()
 
-# Ensure tables exist
+# Ensure tables exist (including a temporary staging table for uncommitted borrows)
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS pack_sales (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,6 +41,14 @@ cursor.execute("""
         borrow_amount REAL,
         status TEXT DEFAULT 'Pending',
         FOREIGN KEY(sale_id) REFERENCES pack_sales(id)
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS temp_staged_borrows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pack_number INTEGER,
+        borrower_name TEXT,
+        borrow_amount REAL
     )
 """)
 cursor.execute("""
@@ -70,9 +78,6 @@ except:
   pass
 
 # Initialize session state variables
-if "temp_borrowers" not in st.session_state:
-  st.session_state.temp_borrowers = []
-
 if "show_password_prompt" not in st.session_state:
   st.session_state.show_password_prompt = False
 
@@ -178,20 +183,39 @@ with tab1:
 
   if st.button("+ Add Borrower to List"):
     if b_name.strip() and b_amt > 0:
-      st.session_state.temp_borrowers.append(
-          {"name": b_name.strip(), "amount": b_amt}
+      # Save directly to the cloud staging table so it doesn't get lost
+      cursor.execute(
+          """
+                INSERT INTO temp_staged_borrows (pack_number, borrower_name, borrow_amount)
+                VALUES (?, ?, ?)
+            """,
+          (current_pack, b_name.strip(), b_amt),
       )
-      st.success(f"Added {b_name.strip()} (Rs. {b_amt:,.2f}) to this pack.")
+      conn.commit()
+      conn.sync()
+      st.success(f"Added {b_name.strip()} (Rs. {b_amt:,.2f}) securely.")
+      st.rerun()
     else:
       st.error("Please enter a valid borrower name and amount.")
 
-  if st.session_state.temp_borrowers:
+  # Fetch staged borrowers for the current pack from the cloud database
+  cursor.execute(
+      "SELECT id, borrower_name, borrow_amount FROM temp_staged_borrows WHERE"
+      " pack_number = ?",
+      (current_pack,),
+  )
+  staged_borrowers = cursor.fetchall()
+
+  if staged_borrowers:
     st.markdown("**Queue of Borrowers for This Pack:**")
-    for idx, b in enumerate(st.session_state.temp_borrowers):
+    for row_item in staged_borrowers:
+      b_id, name, amount = row_item
       col_a, col_b = st.columns([4, 1])
-      col_a.text(f"{b['name']} : Rs. {b['amount']:,.2f}")
-      if col_b.button("Remove", key=f"rm_borrower_{idx}"):
-        st.session_state.temp_borrowers.pop(idx)
+      col_a.text(f"{name} : Rs. {amount:,.2f}")
+      if col_b.button("Remove", key=f"rm_staged_{b_id}"):
+        cursor.execute("DELETE FROM temp_staged_borrows WHERE id = ?", (b_id,))
+        conn.commit()
+        conn.sync()
         st.rerun()
 
   if st.button("Save Pack & Move to Next", type="primary"):
@@ -204,19 +228,26 @@ with tab1:
     )
     sale_id = cursor.lastrowid
 
-    for b in st.session_state.temp_borrowers:
+    # Move all staged borrowers for this pack into the final permanent table
+    for row_item in staged_borrowers:
+      b_id, name, amount = row_item
       cursor.execute(
           """
                 INSERT INTO pack_borrows (sale_id, borrower_name, borrow_amount, status)
                 VALUES (?, ?, ?, 'Pending')
             """,
-          (sale_id, b["name"], b["amount"]),
+          (sale_id, name, amount),
       )
+
+    # Clear out the staging table for this pack
+    cursor.execute(
+        "DELETE FROM temp_staged_borrows WHERE pack_number = ?", (current_pack,)
+    )
 
     conn.commit()
     conn.sync()
 
-    st.session_state.temp_borrowers = []
+    # Reset input fields on screen
     if "cash_pay_in" in st.session_state:
       del st.session_state["cash_pay_in"]
     if "bank_dep_in" in st.session_state:
@@ -260,7 +291,6 @@ with tab2:
 with tab3:
   st.subheader("Record Bank Account Expenses (Purchases)")
   with st.form("expense_form"):
-    # Replaced dropdown with a free text field for expense description
     exp_desc = st.text_input("Expense Description / Note")
     exp_amt = st.number_input(
         "Amount (Rs.)", min_value=0.0, step=100.0, key="exp_amt_input"
