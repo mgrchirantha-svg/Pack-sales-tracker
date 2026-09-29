@@ -23,7 +23,7 @@ def get_connection():
 conn = get_connection()
 cursor = conn.cursor()
 
-# Ensure tables exist (including a temporary staging table for uncommitted borrows)
+# Ensure tables exist
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS pack_sales (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,7 +183,6 @@ with tab1:
 
   if st.button("+ Add Borrower to List"):
     if b_name.strip() and b_amt > 0:
-      # Save directly to the cloud staging table so it doesn't get lost
       cursor.execute(
           """
                 INSERT INTO temp_staged_borrows (pack_number, borrower_name, borrow_amount)
@@ -198,7 +197,6 @@ with tab1:
     else:
       st.error("Please enter a valid borrower name and amount.")
 
-  # Fetch staged borrowers for the current pack from the cloud database
   cursor.execute(
       "SELECT id, borrower_name, borrow_amount FROM temp_staged_borrows WHERE"
       " pack_number = ?",
@@ -228,7 +226,6 @@ with tab1:
     )
     sale_id = cursor.lastrowid
 
-    # Move all staged borrowers for this pack into the final permanent table
     for row_item in staged_borrowers:
       b_id, name, amount = row_item
       cursor.execute(
@@ -239,15 +236,12 @@ with tab1:
           (sale_id, name, amount),
       )
 
-    # Clear out the staging table for this pack
     cursor.execute(
         "DELETE FROM temp_staged_borrows WHERE pack_number = ?", (current_pack,)
     )
-
     conn.commit()
     conn.sync()
 
-    # Reset input fields on screen
     if "cash_pay_in" in st.session_state:
       del st.session_state["cash_pay_in"]
     if "bank_dep_in" in st.session_state:
@@ -365,7 +359,9 @@ with tab4:
     st.info("No pending customer debts found.")
 
 with tab5:
-  st.subheader("Sales History")
+  st.subheader("Sales History (Grouped by Sets of 10 Packs)")
+
+  # Fetch all sales data ordered chronologically/by ID
   cursor.execute("""
         SELECT 
             ps.id, 
@@ -377,22 +373,50 @@ with tab5:
         FROM pack_sales ps
         LEFT JOIN pack_borrows pb ON ps.id = pb.sale_id
         GROUP BY ps.id
-        ORDER BY ps.id DESC
+        ORDER BY ps.id ASC
     """)
   history_data = cursor.fetchall()
+
   if history_data:
-    st.table(
-        [
-            {
-                "Sale ID": r[0],
-                "Pack #": r[1],
-                "Cash Payment": f"Rs. {r[2]:,.2f}",
-                "Bank Deposit": f"Rs. {r[3]:,.2f}",
-                "Money to Receive": f"Rs. {r[4]:,.2f}",
-                "Total Received": f"Rs. {r[5]:,.2f}",
-            }
-            for r in history_data
-        ]
-    )
+    # Group rows into batches of 10 based on position or total sales count
+    batches = {}
+    for i, r in enumerate(history_data):
+      # Calculate batch block (e.g., Sales 1-10 -> Group 1, 11-20 -> Group 2)
+      batch_num = (i // 10) + 1
+      start_pack = ((batch_num - 1) * 10) + 1
+      end_pack = batch_num * 10
+      batch_key = f"Packs {start_pack} to {end_pack} (Batch {batch_num})"
+
+      if batch_key not in batches:
+        batches[batch_key] = []
+      batches[batch_key].append(r)
+
+    # Display each batch in reverse order so the newest set of 10 is at the top
+    for batch_title, rows in sorted(batches.items(), reverse=True):
+      # Default latest batch to expanded, older batches collapsed
+      is_expanded = batch_title == list(batches.keys())[-1]
+
+      with st.expander(batch_title, expanded=is_expanded):
+        table_rows = []
+        batch_total_received = 0.0
+
+        for r in rows:
+          total_received_val = r[5]
+          batch_total_received += total_received_val
+
+          table_rows.append({
+              "Sale ID": r[0],
+              "Pack #": r[1],
+              "Cash Payment": f"Rs. {r[2]:,.2f}",
+              "Bank Deposit": f"Rs. {r[3]:,.2f}",
+              "Money to Receive": f"Rs. {r[4]:,.2f}",
+              "Total Received": f"Rs. {r[5]:,.2f}",
+          })
+
+        st.table(table_rows)
+        st.markdown(
+            f"**Total Received for this Group of Packs:** Rs."
+            f" {batch_total_received:,.2f}"
+        )
   else:
     st.info("No sales recorded yet.")
