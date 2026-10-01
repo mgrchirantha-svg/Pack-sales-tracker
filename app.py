@@ -85,7 +85,7 @@ if "authenticated" not in st.session_state:
   st.session_state.authenticated = False
 
 # --- DASHBOARD HEADER ---
-st.title("🚬 Dashboard")
+st.title("Dashboard")
 st.markdown("Track packs, cash on hand, bank balances, and customer debts.")
 
 # --- SECURE FINANCIAL BALANCES SECTION ---
