@@ -3,7 +3,7 @@ import streamlit as st
 
 # Page Configuration
 st.set_page_config(
-    page_title="Dashboard", page_icon="🚬", layout="wide"
+    page_title="Dashboard", page_icon="🍾", layout="wide"
 )
 
 # --- TURSO CLOUD CONNECTION ---
@@ -16,7 +16,7 @@ def get_connection():
   conn = libsql.connect(
       "/tmp/bottle_sales.db", sync_url=TURSO_URL, auth_token=TURSO_TOKEN
   )
-  conn.sync()
+  conn.sync()  # Sync once on initial boot
   return conn
 
 
@@ -71,12 +71,6 @@ cursor.execute("""
 """)
 conn.commit()
 
-# Sync latest cloud data
-try:
-  conn.sync()
-except:
-  pass
-
 # Initialize session state variables
 if "show_password_prompt" not in st.session_state:
   st.session_state.show_password_prompt = False
@@ -85,7 +79,7 @@ if "authenticated" not in st.session_state:
   st.session_state.authenticated = False
 
 # --- DASHBOARD HEADER ---
-st.title("Dashboard")
+st.title("Web Dashboard")
 st.markdown("Track packs, cash on hand, bank balances, and customer debts.")
 
 # --- SECURE FINANCIAL BALANCES SECTION ---
@@ -191,7 +185,11 @@ with tab1:
           (current_pack, b_name.strip(), b_amt),
       )
       conn.commit()
-      conn.sync()
+      # Sync only on write actions
+      try:
+        conn.sync()
+      except:
+        pass
       st.success(f"Added {b_name.strip()} (Rs. {b_amt:,.2f}) securely.")
       st.rerun()
     else:
@@ -213,7 +211,10 @@ with tab1:
       if col_b.button("Remove", key=f"rm_staged_{b_id}"):
         cursor.execute("DELETE FROM temp_staged_borrows WHERE id = ?", (b_id,))
         conn.commit()
-        conn.sync()
+        try:
+          conn.sync()
+        except:
+          pass
         st.rerun()
 
   if st.button("Save Pack & Move to Next", type="primary"):
@@ -240,7 +241,10 @@ with tab1:
         "DELETE FROM temp_staged_borrows WHERE pack_number = ?", (current_pack,)
     )
     conn.commit()
-    conn.sync()
+    try:
+      conn.sync()
+    except:
+      pass
 
     if "cash_pay_in" in st.session_state:
       del st.session_state["cash_pay_in"]
@@ -278,7 +282,10 @@ with tab2:
             (dep_type, dep_amt, dep_notes),
         )
         conn.commit()
-        conn.sync()
+        try:
+          conn.sync()
+        except:
+          pass
         st.success("Bank deposit recorded and synced!")
         st.rerun()
 
@@ -305,7 +312,10 @@ with tab3:
             ("Bank Expense", exp_amt, exp_desc.strip()),
         )
         conn.commit()
-        conn.sync()
+        try:
+          conn.sync()
+        except:
+          pass
         st.success("Bank expense recorded and balance updated!")
         st.rerun()
 
@@ -352,7 +362,10 @@ with tab4:
             "UPDATE pack_borrows SET status = 'Paid' WHERE id = ?", (d_id,)
         )
         conn.commit()
-        conn.sync()
+        try:
+          conn.sync()
+        except:
+          pass
         st.success(f"Cleared debt for {borrower}!")
         st.rerun()
   else:
@@ -361,7 +374,6 @@ with tab4:
 with tab5:
   st.subheader("Sales History (Grouped by Sets of 10 Packs)")
 
-  # Fetch all sales data ordered chronologically/by ID
   cursor.execute("""
         SELECT 
             ps.id, 
@@ -378,10 +390,8 @@ with tab5:
   history_data = cursor.fetchall()
 
   if history_data:
-    # Group rows into batches of 10 based on position or total sales count
     batches = {}
     for i, r in enumerate(history_data):
-      # Calculate batch block (e.g., Sales 1-10 -> Group 1, 11-20 -> Group 2)
       batch_num = (i // 10) + 1
       start_pack = ((batch_num - 1) * 10) + 1
       end_pack = batch_num * 10
@@ -391,9 +401,7 @@ with tab5:
         batches[batch_key] = []
       batches[batch_key].append(r)
 
-    # Display each batch in reverse order so the newest set of 10 is at the top
     for batch_title, rows in sorted(batches.items(), reverse=True):
-      # Default latest batch to expanded, older batches collapsed
       is_expanded = batch_title == list(batches.keys())[-1]
 
       with st.expander(batch_title, expanded=is_expanded):
