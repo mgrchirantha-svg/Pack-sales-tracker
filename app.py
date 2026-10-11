@@ -186,3 +186,4 @@ with tab1:
         "Direct Customer Bank Transfer Amount (Rs.)",
         min_value=0.0,
         step=1
+    )
