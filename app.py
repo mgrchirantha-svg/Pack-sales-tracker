@@ -11,37 +11,40 @@ st.set_page_config(
 TURSO_URL = "libsql://pack-sales-record-chirantha.aws-ap-south-1.turso.io"
 TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTA1Nzk1NTAsImlkIjoiMDFhMGU2N2ItMmEwMS03MjFjLWJhNTYtMTI2MTMwY2VlNDA5Iiwia2lkIjoiZ3dhSGsyaTV0TXlMWDRWS05KQ1BzQkx2Z01abFpNOG5yOFVVUmhmdzBKWSIsInJpZCI6IjcwMTUxZjI3LTlhZWItNDQzNS04NDZiLWJlMWU4MjQwMjk0NiJ9.UivYy_canij3-i5YvPsdujnIrxkc0nEcjNNf69q8ucCZLi2ZGTNU6QOJstTIua4bOCsYtDYLglU7Zttv0sYtDQ"
 
+DB_PATH = "/tmp/bottle_sales.db"
 
 @st.cache_resource
 def get_connection():
-    db_path = "/tmp/bottle_sales.db"
-    
     # If the local replica file is empty, remove it
-    if os.path.exists(db_path) and os.path.getsize(db_path) == 0:
-        os.remove(db_path)
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) == 0:
+        os.remove(DB_PATH)
         
     try:
         conn = libsql.connect(
-            db_path, sync_url=TURSO_URL, auth_token=TURSO_TOKEN
+            DB_PATH, sync_url=TURSO_URL, auth_token=TURSO_TOKEN
         )
-    except ValueError as e:
-        if "file is not a database" in str(e):
-            if os.path.exists(db_path):
-                os.remove(db_path)
-            # Clear Streamlit's cache to force a fresh connection
-            st.cache_resource.clear()
-            conn = libsql.connect(
-                db_path, sync_url=TURSO_URL, auth_token=TURSO_TOKEN
-            )
-        else:
-            raise e
-            
-    conn.sync()  # Sync once on initial boot
-    return conn
+        conn.sync()  # Sync once on initial boot
+        return conn
+    except Exception as e:
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+        raise e
 
-
-conn = get_connection()
-cursor = conn.cursor()
+# Robust self-healing connection loader
+try:
+    conn = get_connection()
+    cursor = conn.cursor()
+    # Test query to ensure the database is valid and readable
+    cursor.execute("SELECT 1")
+except Exception as e:
+    if "file is not a database" in str(e) or "database disk image is malformed" in str(e):
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+        st.cache_resource.clear()
+        st.rerun()
+    else:
+        st.error(f"Database connection error: {e}")
+        st.stop()
 
 # Ensure tables exist
 cursor.execute("""
