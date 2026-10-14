@@ -15,7 +15,6 @@ DB_PATH = "/tmp/bottle_sales.db"
 
 @st.cache_resource
 def get_connection():
-    # If the local replica file is empty, remove it
     if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) == 0:
         os.remove(DB_PATH)
         
@@ -30,24 +29,45 @@ def get_connection():
             os.remove(DB_PATH)
         raise e
 
+# Helper wrapper to safely execute queries and auto-heal if corruption occurs
+def safe_execute(query, params=(), fetchone=False, fetchall=False, commit=False):
+    global conn, cursor
+    try:
+        cursor.execute(query, params)
+        if commit:
+            conn.commit()
+            try:
+                conn.sync()
+            except Exception:
+                pass
+        
+        if fetchone:
+            return cursor.fetchone()
+        if fetchall:
+            return cursor.fetchall()
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "file is not a database" in err_msg or "database disk image is malformed" in err_msg:
+            if os.path.exists(DB_PATH):
+                os.remove(DB_PATH)
+            st.cache_resource.clear()
+            st.rerun()
+        else:
+            raise e
+
 # Robust self-healing connection loader
 try:
     conn = get_connection()
     cursor = conn.cursor()
-    # Test query to ensure the database is valid and readable
-    cursor.execute("SELECT 1")
+    safe_execute("SELECT 1")
 except Exception as e:
-    if "file is not a database" in str(e) or "database disk image is malformed" in str(e):
-        if os.path.exists(DB_PATH):
-            os.remove(DB_PATH)
-        st.cache_resource.clear()
-        st.rerun()
-    else:
-        st.error(f"Database connection error: {e}")
-        st.stop()
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
+    st.cache_resource.clear()
+    st.rerun()
 
 # Ensure tables exist
-cursor.execute("""
+safe_execute("""
     CREATE TABLE IF NOT EXISTS pack_sales (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         pack_number INTEGER,
@@ -55,8 +75,9 @@ cursor.execute("""
         cash_deposit REAL,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )
-""")
-cursor.execute("""
+""", commit=True)
+
+safe_execute("""
     CREATE TABLE IF NOT EXISTS pack_borrows (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sale_id INTEGER,
@@ -65,16 +86,18 @@ cursor.execute("""
         status TEXT DEFAULT 'Pending',
         FOREIGN KEY(sale_id) REFERENCES pack_sales(id)
     )
-""")
-cursor.execute("""
+""", commit=True)
+
+safe_execute("""
     CREATE TABLE IF NOT EXISTS temp_staged_borrows (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         pack_number INTEGER,
         borrower_name TEXT,
         borrow_amount REAL
     )
-""")
-cursor.execute("""
+""", commit=True)
+
+safe_execute("""
     CREATE TABLE IF NOT EXISTS bank_deposits (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         deposit_type TEXT,
@@ -82,8 +105,9 @@ cursor.execute("""
         notes TEXT,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )
-""")
-cursor.execute("""
+""", commit=True)
+
+safe_execute("""
     CREATE TABLE IF NOT EXISTS bank_expenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         expense_category TEXT,
@@ -91,8 +115,7 @@ cursor.execute("""
         notes TEXT,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )
-""")
-conn.commit()
+""", commit=True)
 
 # Initialize session state variables
 if "show_password_prompt" not in st.session_state:
@@ -108,9 +131,7 @@ st.markdown("Track packs, cash on hand, bank balances, and customer debts.")
 # --- SECURE FINANCIAL BALANCES SECTION ---
 if not st.session_state.authenticated:
     if st.button("🔒 Click to View Cash & Bank Balances"):
-        st.session_state.show_password_prompt = (
-            not st.session_state.show_password_prompt
-        )
+        st.session_state.show_password_prompt = not st.session_state.show_password_prompt
 
     if st.session_state.show_password_prompt:
         entered_pwd = st.text_input(
@@ -129,28 +150,19 @@ else:
         st.session_state.authenticated = False
         st.rerun()
 
-    # Calculate and display balances only when unlocked
-    cursor.execute("""
+    total_cash_collected = safe_execute("""
         SELECT 
             (SELECT COALESCE(SUM(cash_payment), 0) FROM pack_sales) +
             (SELECT COALESCE(SUM(borrow_amount), 0) FROM pack_borrows WHERE status = 'Paid')
-    """)
-    total_cash_collected = cursor.fetchone()[0]
+    """, fetchone=True)[0]
 
-    cursor.execute("SELECT COALESCE(SUM(cash_deposit), 0) FROM pack_sales")
-    sales_bank_deposits = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM bank_deposits")
-    total_standalone_deposits = cursor.fetchone()[0]
-
-    cursor.execute("""
+    sales_bank_deposits = safe_execute("SELECT COALESCE(SUM(cash_deposit), 0) FROM pack_sales", fetchone=True)[0]
+    total_standalone_deposits = safe_execute("SELECT COALESCE(SUM(amount), 0) FROM bank_deposits", fetchone=True)[0]
+    cash_drawer_to_bank_deposits = safe_execute("""
         SELECT COALESCE(SUM(amount), 0) FROM bank_deposits 
         WHERE deposit_type LIKE '%Cash on Hand%'
-    """)
-    cash_drawer_to_bank_deposits = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM bank_expenses")
-    total_bank_expenses = cursor.fetchone()[0]
+    """, fetchone=True)[0]
+    total_bank_expenses = safe_execute("SELECT COALESCE(SUM(amount), 0) FROM bank_expenses", fetchone=True)[0]
 
     cash_on_hand = total_cash_collected - cash_drawer_to_bank_deposits
     total_bank_balance = (
@@ -175,8 +187,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 )
 
 # Determine current pack state
-cursor.execute("SELECT pack_number FROM pack_sales ORDER BY id DESC LIMIT 1")
-row = cursor.fetchone()
+row = safe_execute("SELECT pack_number FROM pack_sales ORDER BY id DESC LIMIT 1", fetchone=True)
 current_pack = (row[0] % 10) + 1 if row else 1
 
 with tab1:
@@ -200,28 +211,24 @@ with tab1:
 
     if st.button("+ Add Borrower to List"):
         if b_name.strip() and b_amt > 0:
-            cursor.execute(
+            safe_execute(
                 """
                     INSERT INTO temp_staged_borrows (pack_number, borrower_name, borrow_amount)
                     VALUES (?, ?, ?)
                 """,
                 (current_pack, b_name.strip(), b_amt),
+                commit=True
             )
-            conn.commit()
-            try:
-                conn.sync()
-            except:
-                pass
             st.success(f"Added {b_name.strip()} (Rs. {b_amt:,.2f}) securely.")
             st.rerun()
         else:
             st.error("Please enter a valid borrower name and amount.")
 
-    cursor.execute(
+    staged_borrowers = safe_execute(
         "SELECT id, borrower_name, borrow_amount FROM temp_staged_borrows WHERE pack_number = ?",
         (current_pack,),
+        fetchall=True
     )
-    staged_borrowers = cursor.fetchall()
 
     if staged_borrowers:
         st.markdown("**Queue of Borrowers for This Pack:**")
@@ -230,42 +237,32 @@ with tab1:
             col_a, col_b = st.columns([4, 1])
             col_a.text(f"{name} : Rs. {amount:,.2f}")
             if col_b.button("Remove", key=f"rm_staged_{b_id}"):
-                cursor.execute("DELETE FROM temp_staged_borrows WHERE id = ?", (b_id,))
-                conn.commit()
-                try:
-                    conn.sync()
-                except:
-                    pass
+                safe_execute("DELETE FROM temp_staged_borrows WHERE id = ?", (b_id,), commit=True)
                 st.rerun()
 
     if st.button("Save Pack & Move to Next", type="primary"):
-        cursor.execute(
+        safe_execute(
             """
                 INSERT INTO pack_sales (pack_number, cash_payment, cash_deposit)
                 VALUES (?, ?, ?)
             """,
             (current_pack, cash_pay, bank_dep),
+            commit=True
         )
         sale_id = cursor.lastrowid
 
         for row_item in staged_borrowers:
             b_id, name, amount = row_item
-            cursor.execute(
+            safe_execute(
                 """
                     INSERT INTO pack_borrows (sale_id, borrower_name, borrow_amount, status)
                     VALUES (?, ?, ?, 'Pending')
                 """,
                 (sale_id, name, amount),
+                commit=True
             )
 
-        cursor.execute(
-            "DELETE FROM temp_staged_borrows WHERE pack_number = ?", (current_pack,)
-        )
-        conn.commit()
-        try:
-            conn.sync()
-        except:
-            pass
+        safe_execute("DELETE FROM temp_staged_borrows WHERE pack_number = ?", (current_pack,), commit=True)
 
         if "cash_pay_in" in st.session_state:
             del st.session_state["cash_pay_in"]
@@ -295,18 +292,14 @@ with tab2:
             if dep_amt <= 0:
                 st.error("Please enter a valid amount.")
             else:
-                cursor.execute(
+                safe_execute(
                     """
                         INSERT INTO bank_deposits (deposit_type, amount, notes)
                         VALUES (?, ?, ?)
                     """,
                     (dep_type, dep_amt, dep_notes),
+                    commit=True
                 )
-                conn.commit()
-                try:
-                    conn.sync()
-                except:
-                    pass
                 st.success("Bank deposit recorded and synced!")
                 st.rerun()
 
@@ -325,26 +318,22 @@ with tab3:
             elif exp_amt <= 0:
                 st.error("Please enter a valid expense amount.")
             else:
-                cursor.execute(
+                safe_execute(
                     """
                         INSERT INTO bank_expenses (expense_category, amount, notes)
                         VALUES (?, ?, ?)
                     """,
                     ("Bank Expense", exp_amt, exp_desc.strip()),
+                    commit=True
                 )
-                conn.commit()
-                try:
-                    conn.sync()
-                except:
-                    pass
                 st.success("Bank expense recorded and balance updated!")
                 st.rerun()
 
     st.markdown("### Recent Bank Expenses History")
-    cursor.execute(
-        "SELECT id, notes, amount, timestamp FROM bank_expenses ORDER BY id DESC LIMIT 10"
+    expense_data = safe_execute(
+        "SELECT id, notes, amount, timestamp FROM bank_expenses ORDER BY id DESC LIMIT 10",
+        fetchall=True
     )
-    expense_data = cursor.fetchall()
     if expense_data:
         st.table(
             [
@@ -362,13 +351,12 @@ with tab3:
 
 with tab4:
     st.subheader("Outstanding Customer Borrows")
-    cursor.execute("""
+    pending_debts = safe_execute("""
         SELECT pb.id, ps.pack_number, pb.borrower_name, pb.borrow_amount 
         FROM pack_borrows pb
         JOIN pack_sales ps ON pb.sale_id = ps.id
         WHERE pb.status = 'Pending'
-    """)
-    pending_debts = cursor.fetchall()
+    """, fetchall=True)
 
     if pending_debts:
         for debt in pending_debts:
@@ -378,23 +366,16 @@ with tab4:
             cols[1].text(f"Pack #{pack_no}")
             cols[2].text(f"Rs. {amount:,.2f}")
             if cols[3].button("Mark Paid", key=f"pay_{d_id}"):
-                cursor.execute(
-                    "UPDATE pack_borrows SET status = 'Paid' WHERE id = ?", (d_id,)
-                )
-                conn.commit()
-                try:
-                    conn.sync()
-                except:
-                    pass
+                safe_execute("UPDATE pack_borrows SET status = 'Paid' WHERE id = ?", (d_id,), commit=True)
                 st.success(f"Cleared debt for {borrower}!")
                 st.rerun()
     else:
-        st.info("No pending customer debts found.")
+      st.info("No pending customer debts found.")
 
 with tab5:
     st.subheader("Sales History (Grouped by Sets of 10 Packs)")
 
-    cursor.execute("""
+    history_data = safe_execute("""
         SELECT 
             ps.id, 
             ps.pack_number, 
@@ -406,8 +387,7 @@ with tab5:
         LEFT JOIN pack_borrows pb ON ps.id = pb.sale_id
         GROUP BY ps.id
         ORDER BY ps.id ASC
-    """)
-    history_data = cursor.fetchall()
+    """, fetchall=True)
 
     if history_data:
         batches = {}
