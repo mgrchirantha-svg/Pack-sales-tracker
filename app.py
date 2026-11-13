@@ -1,8 +1,6 @@
 import os
-import time
-import queue
 import threading
-from datetime import datetime
+from collections import OrderedDict
 
 import libsql
 import streamlit as st
@@ -35,20 +33,7 @@ class DatabaseManager:
         self.connection = connection
         self.lock = threading.RLock()
 
-        self.sync_queue = queue.Queue()
-
-        self.status_lock = threading.Lock()
-
-        self.pending_syncs = 0
         self.last_sync_error = None
-        self.last_sync_time = None
-
-        self.worker = threading.Thread(
-            target=self._sync_worker,
-            daemon=True
-        )
-
-        self.worker.start()
 
     # --------------------------------------------------------
     # READ OPERATIONS
@@ -84,9 +69,9 @@ class DatabaseManager:
 
             cursor = self.connection.cursor()
 
-            cursor.execute("BEGIN")
-
             try:
+
+                cursor.execute("BEGIN")
 
                 result = operation(cursor)
 
@@ -98,108 +83,26 @@ class DatabaseManager:
 
                 raise
 
-        # Queue synchronization instead of waiting for Turso.
-        with self.status_lock:
+            # The transaction has committed locally.
+            # Synchronize only after the transaction is finished.
 
-            self.pending_syncs += 1
+            try:
 
-            self.last_sync_error = None
+                self.connection.sync()
 
-        self.sync_queue.put(1)
+                self.last_sync_error = None
 
-        return result
+            except Exception as exc:
 
-    # --------------------------------------------------------
-    # BACKGROUND SYNCHRONIZATION
-    # --------------------------------------------------------
+                self.last_sync_error = str(exc)
 
-    def _sync_worker(self):
-
-        while True:
-
-            self.sync_queue.get()
-
-            batch_size = 1
-
-            # Combine queued changes into one synchronization.
-            while True:
-
-                try:
-
-                    self.sync_queue.get_nowait()
-
-                    batch_size += 1
-
-                except queue.Empty:
-
-                    break
-
-            success = False
-            error_message = None
-
-            # Retry failed synchronization.
-            for attempt in range(3):
-
-                try:
-
-                    with self.lock:
-
-                        self.connection.sync()
-
-                    success = True
-
-                    break
-
-                except Exception as exc:
-
-                    error_message = str(exc)
-
-                    time.sleep(2 ** attempt)
-
-            with self.status_lock:
-
-                self.pending_syncs = max(
-                    0,
-                    self.pending_syncs - batch_size
+                st.warning(
+                    "The change was saved locally, but synchronization "
+                    "with Turso failed. Check your internet connection. "
+                    "Avoid entering the same transaction again."
                 )
 
-                if success:
-
-                    self.last_sync_error = None
-
-                    self.last_sync_time = datetime.now()
-
-                else:
-
-                    self.last_sync_error = error_message
-
-            for _ in range(batch_size):
-
-                self.sync_queue.task_done()
-
-    # --------------------------------------------------------
-    # SYNC STATUS
-    # --------------------------------------------------------
-
-    def get_sync_status(self):
-
-        with self.status_lock:
-
-            return {
-                "pending": self.pending_syncs,
-                "error": self.last_sync_error,
-                "last_sync": self.last_sync_time
-            }
-
-    def retry_sync(self):
-
-        with self.status_lock:
-
-            self.pending_syncs += 1
-
-            self.last_sync_error = None
-
-        self.sync_queue.put(1)
+            return result
 
 
 # ============================================================
@@ -234,10 +137,9 @@ def get_database():
         auth_token=turso_token
     )
 
-    # Initial synchronization happens only once.
+    # Initial synchronization.
     connection.sync()
 
-    # Create tables without deleting existing records.
     cursor = connection.cursor()
 
     statements = [
@@ -341,7 +243,8 @@ def get_database():
         """
         CREATE INDEX IF NOT EXISTS idx_deposit_type
         ON bank_deposits(deposit_type)
-        """
+        """,
+
     ]
 
     cursor.execute("BEGIN")
@@ -360,7 +263,7 @@ def get_database():
 
         raise
 
-    # Synchronize schema changes before normal use.
+    # Synchronize schema changes.
     connection.sync()
 
     return DatabaseManager(connection)
@@ -450,8 +353,11 @@ def get_current_pack():
     row = fetch_one(
         """
         SELECT pack_number
+
         FROM pack_sales
+
         ORDER BY id DESC
+
         LIMIT 1
         """
     )
@@ -545,37 +451,11 @@ st.caption(
 
 display_flash()
 
+st.caption(
+    "☁️ Database connected. Changes synchronize after saving."
+)
 
-# ============================================================
-# SYNCHRONIZATION STATUS
-# ============================================================
-
-sync_status = db.get_sync_status()
-
-if sync_status["pending"] > 0:
-
-    st.info(
-        "🔄 Synchronizing changes with Turso in the background..."
-    )
-
-elif sync_status["error"]:
-
-    st.error(
-        "⚠️ Synchronization failed. Your changes are saved locally, "
-        "but have not been confirmed in Turso."
-    )
-
-    st.caption(sync_status["error"])
-
-    if st.button("Retry Turso Synchronization"):
-
-        db.retry_sync()
-
-        st.rerun()
-
-else:
-
-    st.caption("☁️ Database synchronization is up to date.")
+st.divider()
 
 
 # ============================================================
@@ -668,11 +548,15 @@ if selected_section == "📦 Record Sales":
 
         if not borrower_name.strip():
 
-            st.error("Please enter a borrower name.")
+            st.error(
+                "Please enter a borrower name."
+            )
 
         elif borrower_amount <= 0:
 
-            st.error("Please enter a valid amount.")
+            st.error(
+                "Please enter a valid amount."
+            )
 
         else:
 
@@ -701,8 +585,7 @@ if selected_section == "📦 Record Sales":
                 write_transaction(insert_borrower)
 
                 set_flash(
-                    f"Added {borrower_name.strip()} successfully. "
-                    "Synchronizing in the background."
+                    f"Added {borrower_name.strip()} successfully."
                 )
 
                 st.rerun()
@@ -720,8 +603,11 @@ if selected_section == "📦 Record Sales":
     staged_borrowers = fetch_all(
         """
         SELECT
+
             id,
+
             borrower_name,
+
             borrow_amount
 
         FROM temp_staged_borrows
@@ -760,6 +646,7 @@ if selected_section == "📦 Record Sales":
                     cursor.execute(
                         """
                         DELETE FROM temp_staged_borrows
+
                         WHERE id = ?
                         """,
 
@@ -820,12 +707,14 @@ if selected_section == "📦 Record Sales":
 
     if save_pack:
 
-        # Fetch the queue again immediately before saving.
         latest_borrowers = fetch_all(
             """
             SELECT
+
                 id,
+
                 borrower_name,
+
                 borrow_amount
 
             FROM temp_staged_borrows
@@ -886,6 +775,7 @@ if selected_section == "📦 Record Sales":
             cursor.execute(
                 """
                 DELETE FROM temp_staged_borrows
+
                 WHERE pack_number = ?
                 """,
 
@@ -901,8 +791,7 @@ if selected_section == "📦 Record Sales":
             )
 
             set_flash(
-                f"Pack {current_pack} saved successfully. "
-                "Turso synchronization is running in the background."
+                f"Pack {current_pack} saved successfully."
             )
 
             st.rerun()
@@ -986,8 +875,7 @@ elif selected_section == "🏦 Bank Deposits":
                 write_transaction(insert_deposit)
 
                 set_flash(
-                    "Bank deposit recorded successfully. "
-                    "Synchronizing in the background."
+                    "Bank deposit recorded successfully."
                 )
 
                 st.rerun()
@@ -1069,8 +957,7 @@ elif selected_section == "💸 Bank Expenses":
                 write_transaction(insert_expense)
 
                 set_flash(
-                    "Bank expense recorded successfully. "
-                    "Synchronizing in the background."
+                    "Bank expense recorded successfully."
                 )
 
                 st.rerun()
@@ -1090,9 +977,13 @@ elif selected_section == "💸 Bank Expenses":
     expense_data = fetch_all(
         """
         SELECT
+
             id,
+
             notes,
+
             amount,
+
             timestamp
 
         FROM bank_expenses
@@ -1222,8 +1113,7 @@ elif selected_section == "⚠️ Manage Debts":
                     if updated:
 
                         set_flash(
-                            f"Cleared debt for {borrower}. "
-                            "Synchronizing in the background."
+                            f"Cleared debt for {borrower}."
                         )
 
                     else:
@@ -1336,7 +1226,7 @@ elif selected_section == "📊 Sales History":
 
     if history_data:
 
-        batches = {}
+        batches = OrderedDict()
 
         for index, row in enumerate(history_data):
 
@@ -1353,13 +1243,11 @@ elif selected_section == "📊 Sales History":
                 f"(Batch {batch_number})"
             )
 
-            if batch_title not in batches:
+            batches.setdefault(
+                batch_title,
+                []
+            ).append(row)
 
-                batches[batch_title] = []
-
-            batches[batch_title].append(row)
-
-        # Show the newest batch first.
         batch_items = list(batches.items())
 
         batch_items.reverse()
