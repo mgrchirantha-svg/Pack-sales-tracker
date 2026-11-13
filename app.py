@@ -1,6 +1,8 @@
 import os
+import time
+import queue
 import threading
-from collections import OrderedDict
+from datetime import datetime
 
 import libsql
 import streamlit as st
@@ -9,711 +11,1266 @@ import streamlit as st
 # ============================================================
 # PAGE CONFIGURATION
 # ============================================================
+
 st.set_page_config(
     page_title="Dashboard",
     page_icon="🍾",
     layout="wide",
 )
 
-DB_PATH = os.environ.get("TURSO_LOCAL_DB_PATH", "/tmp/bottle_sales.db")
+DB_PATH = os.environ.get(
+    "TURSO_LOCAL_DB_PATH",
+    "/tmp/bottle_sales.db"
+)
 
 
 # ============================================================
-# DATABASE CONNECTION
+# DATABASE MANAGER
 # ============================================================
-def get_secret(name: str) -> str:
-    """Read a required value from Streamlit secrets."""
-    value = st.secrets.get(name)
-    if not value:
-        st.error(
-            f"Missing Streamlit secret: `{name}`. "
-            "Add it to your Streamlit secrets configuration."
+
+class DatabaseManager:
+
+    def __init__(self, connection):
+
+        self.connection = connection
+        self.lock = threading.RLock()
+
+        self.sync_queue = queue.Queue()
+
+        self.status_lock = threading.Lock()
+
+        self.pending_syncs = 0
+        self.last_sync_error = None
+        self.last_sync_time = None
+
+        self.worker = threading.Thread(
+            target=self._sync_worker,
+            daemon=True
         )
+
+        self.worker.start()
+
+    # --------------------------------------------------------
+    # READ OPERATIONS
+    # --------------------------------------------------------
+
+    def fetch_one(self, sql, params=()):
+
+        with self.lock:
+
+            cursor = self.connection.cursor()
+
+            cursor.execute(sql, params)
+
+            return cursor.fetchone()
+
+    def fetch_all(self, sql, params=()):
+
+        with self.lock:
+
+            cursor = self.connection.cursor()
+
+            cursor.execute(sql, params)
+
+            return cursor.fetchall()
+
+    # --------------------------------------------------------
+    # WRITE TRANSACTIONS
+    # --------------------------------------------------------
+
+    def write_transaction(self, operation):
+
+        with self.lock:
+
+            cursor = self.connection.cursor()
+
+            cursor.execute("BEGIN")
+
+            try:
+
+                result = operation(cursor)
+
+                self.connection.commit()
+
+            except Exception:
+
+                self.connection.rollback()
+
+                raise
+
+        # Queue synchronization instead of waiting for Turso.
+        with self.status_lock:
+
+            self.pending_syncs += 1
+
+            self.last_sync_error = None
+
+        self.sync_queue.put(1)
+
+        return result
+
+    # --------------------------------------------------------
+    # BACKGROUND SYNCHRONIZATION
+    # --------------------------------------------------------
+
+    def _sync_worker(self):
+
+        while True:
+
+            self.sync_queue.get()
+
+            batch_size = 1
+
+            # Combine queued changes into one synchronization.
+            while True:
+
+                try:
+
+                    self.sync_queue.get_nowait()
+
+                    batch_size += 1
+
+                except queue.Empty:
+
+                    break
+
+            success = False
+            error_message = None
+
+            # Retry failed synchronization.
+            for attempt in range(3):
+
+                try:
+
+                    with self.lock:
+
+                        self.connection.sync()
+
+                    success = True
+
+                    break
+
+                except Exception as exc:
+
+                    error_message = str(exc)
+
+                    time.sleep(2 ** attempt)
+
+            with self.status_lock:
+
+                self.pending_syncs = max(
+                    0,
+                    self.pending_syncs - batch_size
+                )
+
+                if success:
+
+                    self.last_sync_error = None
+
+                    self.last_sync_time = datetime.now()
+
+                else:
+
+                    self.last_sync_error = error_message
+
+            for _ in range(batch_size):
+
+                self.sync_queue.task_done()
+
+    # --------------------------------------------------------
+    # SYNC STATUS
+    # --------------------------------------------------------
+
+    def get_sync_status(self):
+
+        with self.status_lock:
+
+            return {
+                "pending": self.pending_syncs,
+                "error": self.last_sync_error,
+                "last_sync": self.last_sync_time
+            }
+
+    def retry_sync(self):
+
+        with self.status_lock:
+
+            self.pending_syncs += 1
+
+            self.last_sync_error = None
+
+        self.sync_queue.put(1)
+
+
+# ============================================================
+# DATABASE INITIALIZATION
+# ============================================================
+
+def get_secret(name):
+
+    value = st.secrets.get(name)
+
+    if not value:
+
+        st.error(
+            f"Missing Streamlit secret: {name}"
+        )
+
         st.stop()
+
     return str(value)
 
 
 @st.cache_resource
 def get_database():
-    """
-    Create one shared embedded-replica connection for this app process.
 
-    The lock prevents simultaneous Streamlit sessions from using the same
-    connection/cursor at the same time.
-    """
     turso_url = get_secret("TURSO_DATABASE_URL")
+
     turso_token = get_secret("TURSO_AUTH_TOKEN")
 
     connection = libsql.connect(
         DB_PATH,
         sync_url=turso_url,
-        auth_token=turso_token,
+        auth_token=turso_token
     )
-    lock = threading.RLock()
 
-    with lock:
-        connection.sync()
+    # Initial synchronization happens only once.
+    connection.sync()
 
-    return connection, lock
+    # Create tables without deleting existing records.
+    cursor = connection.cursor()
 
+    statements = [
 
-conn, db_lock = get_database()
+        """
+        CREATE TABLE IF NOT EXISTS pack_sales (
 
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-def fetch_one(sql: str, params=()):
-    """Run a read query safely and return one row."""
-    with db_lock:
-        cursor = conn.cursor()
-        cursor.execute(sql, params)
-        return cursor.fetchone()
+            pack_number INTEGER,
 
+            cash_payment REAL,
 
-def fetch_all(sql: str, params=()):
-    """Run a read query safely and return all rows."""
-    with db_lock:
-        cursor = conn.cursor()
-        cursor.execute(sql, params)
-        return cursor.fetchall()
+            cash_deposit REAL,
 
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 
-def write_transaction(operation):
-    """
-    Execute all related writes in one transaction, then sync once to Turso.
-
-    `operation` receives a cursor and should return any value needed by
-    the caller. A sync error is reported separately because the local
-    transaction may already have committed successfully.
-    """
-    with db_lock:
-        cursor = conn.cursor()
-        cursor.execute("BEGIN")
-
-        try:
-            result = operation(cursor)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-
-        try:
-            conn.sync()
-            sync_error = None
-        except Exception as exc:
-            sync_error = str(exc)
-
-        return result, sync_error
-
-
-def show_write_result(success_message: str, sync_error):
-    """Show an accurate result after a committed local write."""
-    if sync_error:
-        st.warning(
-            f"{success_message} The change was saved locally, but syncing "
-            "with Turso failed. Check your internet connection and refresh "
-            f"the app before making the same entry again. Details: {sync_error}"
         )
-    else:
-        st.success(success_message)
+        """,
 
+        """
+        CREATE TABLE IF NOT EXISTS pack_borrows (
 
-# ============================================================
-# DATABASE TABLES AND INDEXES
-# ============================================================
-def initialize_database():
-    def create_schema(cursor):
-        statements = [
-            """
-            CREATE TABLE IF NOT EXISTS pack_sales (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pack_number INTEGER,
-                cash_payment REAL,
-                cash_deposit REAL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS pack_borrows (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sale_id INTEGER,
-                borrower_name TEXT,
-                borrow_amount REAL,
-                status TEXT DEFAULT 'Pending',
-                FOREIGN KEY(sale_id) REFERENCES pack_sales(id)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS temp_staged_borrows (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pack_number INTEGER,
-                borrower_name TEXT,
-                borrow_amount REAL
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS bank_deposits (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                deposit_type TEXT,
-                amount REAL,
-                notes TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS bank_expenses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                expense_category TEXT,
-                amount REAL,
-                notes TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """,
-            "CREATE INDEX IF NOT EXISTS idx_pack_sales_id ON pack_sales(id)",
-            "CREATE INDEX IF NOT EXISTS idx_pack_borrows_sale_id ON pack_borrows(sale_id)",
-            "CREATE INDEX IF NOT EXISTS idx_pack_borrows_status ON pack_borrows(status)",
-            "CREATE INDEX IF NOT EXISTS idx_staged_pack_number ON temp_staged_borrows(pack_number)",
-            "CREATE INDEX IF NOT EXISTS idx_bank_expenses_id ON bank_expenses(id)",
-        ]
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            sale_id INTEGER,
+
+            borrower_name TEXT,
+
+            borrow_amount REAL,
+
+            status TEXT DEFAULT 'Pending',
+
+            FOREIGN KEY(sale_id)
+                REFERENCES pack_sales(id)
+
+        )
+        """,
+
+        """
+        CREATE TABLE IF NOT EXISTS temp_staged_borrows (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            pack_number INTEGER,
+
+            borrower_name TEXT,
+
+            borrow_amount REAL
+
+        )
+        """,
+
+        """
+        CREATE TABLE IF NOT EXISTS bank_deposits (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            deposit_type TEXT,
+
+            amount REAL,
+
+            notes TEXT,
+
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+
+        )
+        """,
+
+        """
+        CREATE TABLE IF NOT EXISTS bank_expenses (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            expense_category TEXT,
+
+            amount REAL,
+
+            notes TEXT,
+
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+
+        )
+        """,
+
+        """
+        CREATE INDEX IF NOT EXISTS idx_borrows_sale_id
+        ON pack_borrows(sale_id)
+        """,
+
+        """
+        CREATE INDEX IF NOT EXISTS idx_borrows_status
+        ON pack_borrows(status)
+        """,
+
+        """
+        CREATE INDEX IF NOT EXISTS idx_staged_pack
+        ON temp_staged_borrows(pack_number)
+        """,
+
+        """
+        CREATE INDEX IF NOT EXISTS idx_deposit_type
+        ON bank_deposits(deposit_type)
+        """
+    ]
+
+    cursor.execute("BEGIN")
+
+    try:
 
         for statement in statements:
+
             cursor.execute(statement)
 
-    _, sync_error = write_transaction(create_schema)
-    return sync_error
+        connection.commit()
+
+    except Exception:
+
+        connection.rollback()
+
+        raise
+
+    # Synchronize schema changes before normal use.
+    connection.sync()
+
+    return DatabaseManager(connection)
 
 
 try:
-    schema_sync_error = initialize_database()
+
+    db = get_database()
+
 except Exception as exc:
-    st.error(f"Could not initialize the Turso database: {exc}")
+
+    st.error(
+        f"Database connection or initialization failed: {exc}"
+    )
+
     st.stop()
 
 
 # ============================================================
-# SMALL HELPERS
+# DATABASE HELPER FUNCTIONS
 # ============================================================
-def money(value) -> str:
+
+def fetch_one(sql, params=()):
+
+    return db.fetch_one(sql, params)
+
+
+def fetch_all(sql, params=()):
+
+    return db.fetch_all(sql, params)
+
+
+def write_transaction(operation):
+
+    return db.write_transaction(operation)
+
+
+# ============================================================
+# SMALL HELPER FUNCTIONS
+# ============================================================
+
+def money(value):
+
     return f"Rs. {float(value or 0):,.2f}"
 
 
-def get_current_pack() -> int:
-    row = fetch_one(
-        "SELECT pack_number FROM pack_sales ORDER BY id DESC LIMIT 1"
+def set_flash(message, kind="success"):
+
+    st.session_state["dashboard_flash"] = (
+        message,
+        kind
     )
+
+
+def display_flash():
+
+    flash = st.session_state.pop(
+        "dashboard_flash",
+        None
+    )
+
+    if not flash:
+
+        return
+
+    message, kind = flash
+
+    if kind == "error":
+
+        st.error(message)
+
+    elif kind == "warning":
+
+        st.warning(message)
+
+    else:
+
+        st.success(message)
+
+
+# ============================================================
+# CURRENT PACK
+# ============================================================
+
+def get_current_pack():
+
+    row = fetch_one(
+        """
+        SELECT pack_number
+        FROM pack_sales
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    )
+
     if not row or row[0] is None:
+
         return 1
+
     return (int(row[0]) % 10) + 1
 
 
+# ============================================================
+# FINANCIAL BALANCES
+# ============================================================
+
 def get_financial_balances():
-    """
-    Preserve the original balance rules:
-    - Cash on hand = cash payments + paid debts - cash-on-hand deposits.
-    - Bank = sales bank deposits + standalone deposits - bank expenses.
-    - Personal investments increase bank balance but not cash on hand or sales.
-    """
+
     row = fetch_one(
         """
         SELECT
+
             (
                 SELECT COALESCE(SUM(cash_payment), 0)
                 FROM pack_sales
-            ) +
+            )
+
+            +
+
             (
                 SELECT COALESCE(SUM(borrow_amount), 0)
                 FROM pack_borrows
                 WHERE status = 'Paid'
-            ) AS total_cash_collected,
+            ),
 
             (
                 SELECT COALESCE(SUM(cash_deposit), 0)
                 FROM pack_sales
-            ) AS sales_bank_deposits,
+            ),
 
             (
                 SELECT COALESCE(SUM(amount), 0)
                 FROM bank_deposits
-            ) AS standalone_deposits,
+            ),
 
             (
                 SELECT COALESCE(SUM(amount), 0)
                 FROM bank_deposits
                 WHERE deposit_type LIKE '%Cash on Hand%'
-            ) AS cash_drawer_deposits,
+            ),
 
             (
                 SELECT COALESCE(SUM(amount), 0)
                 FROM bank_expenses
-            ) AS bank_expenses
+            )
         """
     )
 
     total_cash_collected = float(row[0] or 0)
+
     sales_bank_deposits = float(row[1] or 0)
+
     standalone_deposits = float(row[2] or 0)
+
     cash_drawer_deposits = float(row[3] or 0)
+
     bank_expenses = float(row[4] or 0)
 
-    cash_on_hand = total_cash_collected - cash_drawer_deposits
-    bank_balance = (
-        sales_bank_deposits + standalone_deposits - bank_expenses
+    cash_on_hand = (
+        total_cash_collected - cash_drawer_deposits
     )
+
+    bank_balance = (
+        sales_bank_deposits
+        + standalone_deposits
+        - bank_expenses
+    )
+
     return cash_on_hand, bank_balance
 
 
-def set_flash(message: str, kind: str = "success"):
-    st.session_state["dashboard_flash"] = (message, kind)
-
-
-def display_flash():
-    flash = st.session_state.pop("dashboard_flash", None)
-    if not flash:
-        return
-
-    message, kind = flash
-    if kind == "error":
-        st.error(message)
-    elif kind == "warning":
-        st.warning(message)
-    else:
-        st.success(message)
-
-
 # ============================================================
-# SESSION STATE AND HEADER
+# DASHBOARD HEADER
 # ============================================================
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if "show_password_prompt" not in st.session_state:
-    st.session_state.show_password_prompt = False
 
 st.title("Web Dashboard")
-st.caption("Track packs, cash on hand, bank balances, and customer debts.")
+
+st.caption(
+    "Track packs, cash on hand, bank balances, "
+    "and customer debts."
+)
 
 display_flash()
 
-if schema_sync_error:
-    st.warning(
-        "Database tables are ready locally, but the initial sync with Turso "
-        f"reported an error: {schema_sync_error}"
+
+# ============================================================
+# SYNCHRONIZATION STATUS
+# ============================================================
+
+sync_status = db.get_sync_status()
+
+if sync_status["pending"] > 0:
+
+    st.info(
+        "🔄 Synchronizing changes with Turso in the background..."
     )
 
+elif sync_status["error"]:
 
-# ============================================================
-# PASSWORD-PROTECTED FINANCIAL SUMMARY
-# ============================================================
-st.subheader("Financial Summary")
+    st.error(
+        "⚠️ Synchronization failed. Your changes are saved locally, "
+        "but have not been confirmed in Turso."
+    )
 
-if not st.session_state.authenticated:
-    if st.button("🔒 Click to View Cash & Bank Balances"):
-        st.session_state.show_password_prompt = (
-            not st.session_state.show_password_prompt
-        )
+    st.caption(sync_status["error"])
 
-    if st.session_state.show_password_prompt:
-        with st.form("dashboard_unlock_form"):
-            entered_password = st.text_input(
-                "Dashboard Password",
-                type="password",
-            )
-            unlock_submitted = st.form_submit_button("Unlock")
+    if st.button("Retry Turso Synchronization"):
 
-        if unlock_submitted:
-            correct_password = get_secret("DASHBOARD_PASSWORD")
-            if entered_password == correct_password:
-                st.session_state.authenticated = True
-                st.session_state.show_password_prompt = False
-                st.rerun()
-            else:
-                st.error("Incorrect password.")
-else:
-    if st.button("🔒 Lock Balances"):
-        st.session_state.authenticated = False
+        db.retry_sync()
+
         st.rerun()
 
-    cash_on_hand, bank_balance = get_financial_balances()
-    balance_col1, balance_col2 = st.columns(2)
-    balance_col1.metric("💵 Cash on Hand", money(cash_on_hand))
-    balance_col2.metric("🏦 Bank Account Balance", money(bank_balance))
+else:
+
+    st.caption("☁️ Database synchronization is up to date.")
+
+
+# ============================================================
+# FINANCIAL SUMMARY
+# ============================================================
+
+st.subheader("Financial Summary")
+
+cash_on_hand, bank_balance = get_financial_balances()
+
+col1, col2 = st.columns(2)
+
+col1.metric(
+    "💵 Cash on Hand",
+    money(cash_on_hand)
+)
+
+col2.metric(
+    "🏦 Bank Account Balance",
+    money(bank_balance)
+)
 
 st.divider()
 
 
 # ============================================================
 # NAVIGATION
-# Using radio navigation instead of st.tabs means only the selected
-# section's queries and UI are executed on each rerun.
 # ============================================================
+
 sections = [
+
     "📦 Record Sales",
+
     "🏦 Bank Deposits",
+
     "💸 Bank Expenses",
+
     "⚠️ Manage Debts",
-    "📊 Sales History",
+
+    "📊 Sales History"
+
 ]
 
 selected_section = st.radio(
-    "Dashboard section",
+    "Dashboard Section",
     sections,
     horizontal=True,
-    label_visibility="collapsed",
+    label_visibility="collapsed"
 )
 
 
 # ============================================================
 # 1. RECORD SALES
 # ============================================================
-if selected_section == "📦 Record Sales":
-    current_pack = get_current_pack()
-    st.subheader(f"Recording Pack: {current_pack} of 10")
 
-    # Form fields do not trigger a complete script rerun for every keystroke.
-    with st.form("pack_sales_form", clear_on_submit=False):
-        cash_payment = st.number_input(
-            "Cash Payment Received (Rs.)",
-            min_value=0.0,
-            step=10.0,
-            key="cash_pay_in",
-        )
-        bank_transfer = st.number_input(
-            "Direct Customer Bank Transfer Amount (Rs.)",
-            min_value=0.0,
-            step=10.0,
-            key="bank_dep_in",
-        )
-        save_pack_submitted = st.form_submit_button(
-            "Save Pack & Move to Next",
-            type="primary",
-        )
+if selected_section == "📦 Record Sales":
+
+    current_pack = get_current_pack()
+
+    st.subheader(
+        f"Recording Pack: {current_pack} of 10"
+    )
+
+    # --------------------------------------------------------
+    # ADD BORROWER
+    # --------------------------------------------------------
 
     st.markdown("### Add Borrowers for This Pack")
 
-    with st.form("add_borrower_form", clear_on_submit=True):
-        borrower_name = st.text_input("Borrower Name")
+    with st.form(
+        "add_borrower_form",
+        clear_on_submit=True
+    ):
+
+        borrower_name = st.text_input(
+            "Borrower Name"
+        )
+
         borrower_amount = st.number_input(
             "Borrow Amount (Rs.)",
             min_value=0.0,
-            step=10.0,
+            step=10.0
         )
-        add_borrower_submitted = st.form_submit_button(
+
+        add_borrower = st.form_submit_button(
             "+ Add Borrower to List"
         )
 
-    if add_borrower_submitted:
-        if borrower_name.strip() and borrower_amount > 0:
-            def add_borrower(cursor):
+    if add_borrower:
+
+        if not borrower_name.strip():
+
+            st.error("Please enter a borrower name.")
+
+        elif borrower_amount <= 0:
+
+            st.error("Please enter a valid amount.")
+
+        else:
+
+            def insert_borrower(cursor):
+
                 cursor.execute(
                     """
                     INSERT INTO temp_staged_borrows
-                        (pack_number, borrower_name, borrow_amount)
+                    (
+                        pack_number,
+                        borrower_name,
+                        borrow_amount
+                    )
                     VALUES (?, ?, ?)
                     """,
+
                     (
                         current_pack,
                         borrower_name.strip(),
-                        borrower_amount,
-                    ),
+                        borrower_amount
+                    )
                 )
 
             try:
-                _, sync_error = write_transaction(add_borrower)
-                show_write_result(
-                    f"Added {borrower_name.strip()} ({money(borrower_amount)}).",
-                    sync_error,
+
+                write_transaction(insert_borrower)
+
+                set_flash(
+                    f"Added {borrower_name.strip()} successfully. "
+                    "Synchronizing in the background."
                 )
+
+                st.rerun()
+
             except Exception as exc:
-                st.error(f"Could not add borrower: {exc}")
-        else:
-            st.error("Please enter a valid borrower name and amount.")
+
+                st.error(
+                    f"Could not add borrower: {exc}"
+                )
+
+    # --------------------------------------------------------
+    # STAGED BORROWERS
+    # --------------------------------------------------------
 
     staged_borrowers = fetch_all(
         """
-        SELECT id, borrower_name, borrow_amount
+        SELECT
+            id,
+            borrower_name,
+            borrow_amount
+
         FROM temp_staged_borrows
+
         WHERE pack_number = ?
+
         ORDER BY id
         """,
-        (current_pack,),
+
+        (current_pack,)
     )
 
     st.markdown("### Borrowers Queued for This Pack")
 
     if staged_borrowers:
-        for staged_id, name, amount in staged_borrowers:
-            col_name, col_amount, col_remove = st.columns([4, 2, 1])
-            col_name.write(name)
-            col_amount.write(money(amount))
 
-            if col_remove.button("Remove", key=f"remove_staged_{staged_id}"):
+        for row in staged_borrowers:
+
+            borrower_id, name, amount = row
+
+            col_a, col_b, col_c = st.columns(
+                [4, 2, 1]
+            )
+
+            col_a.write(name)
+
+            col_b.write(money(amount))
+
+            if col_c.button(
+                "Remove",
+                key=f"remove_borrower_{borrower_id}"
+            ):
+
+                def remove_borrower(cursor):
+
+                    cursor.execute(
+                        """
+                        DELETE FROM temp_staged_borrows
+                        WHERE id = ?
+                        """,
+
+                        (borrower_id,)
+                    )
+
                 try:
-                    def remove_borrower(cursor):
-                        cursor.execute(
-                            "DELETE FROM temp_staged_borrows WHERE id = ?",
-                            (staged_id,),
-                        )
 
-                    _, sync_error = write_transaction(remove_borrower)
-                    show_write_result("Borrower removed from the queue.", sync_error)
+                    write_transaction(remove_borrower)
+
+                    set_flash(
+                        "Borrower removed from the queue."
+                    )
+
                     st.rerun()
-                except Exception as exc:
-                    st.error(f"Could not remove borrower: {exc}")
-    else:
-        st.info("No borrowers added to this pack yet.")
 
-    if save_pack_submitted:
-        # Re-read the queue immediately before saving so the transaction
-        # uses the latest staged borrowers.
-        latest_staged = fetch_all(
-            """
-            SELECT id, borrower_name, borrow_amount
-            FROM temp_staged_borrows
-            WHERE pack_number = ?
-            ORDER BY id
-            """,
-            (current_pack,),
+                except Exception as exc:
+
+                    st.error(
+                        f"Could not remove borrower: {exc}"
+                    )
+
+    else:
+
+        st.info(
+            "No borrowers added to this pack yet."
         )
 
-        def save_pack(cursor):
+    st.divider()
+
+    # --------------------------------------------------------
+    # SAVE PACK
+    # --------------------------------------------------------
+
+    st.markdown("### Pack Payment Details")
+
+    with st.form(
+        "save_pack_form",
+        clear_on_submit=True
+    ):
+
+        cash_payment = st.number_input(
+            "Cash Payment Received (Rs.)",
+            min_value=0.0,
+            step=10.0
+        )
+
+        bank_transfer = st.number_input(
+            "Direct Customer Bank Transfer Amount (Rs.)",
+            min_value=0.0,
+            step=10.0
+        )
+
+        save_pack = st.form_submit_button(
+            "Save Pack & Move to Next",
+            type="primary"
+        )
+
+    if save_pack:
+
+        # Fetch the queue again immediately before saving.
+        latest_borrowers = fetch_all(
+            """
+            SELECT
+                id,
+                borrower_name,
+                borrow_amount
+
+            FROM temp_staged_borrows
+
+            WHERE pack_number = ?
+
+            ORDER BY id
+            """,
+
+            (current_pack,)
+        )
+
+        def save_pack_transaction(cursor):
+
             cursor.execute(
                 """
                 INSERT INTO pack_sales
-                    (pack_number, cash_payment, cash_deposit)
+                (
+                    pack_number,
+                    cash_payment,
+                    cash_deposit
+                )
                 VALUES (?, ?, ?)
                 """,
-                (current_pack, cash_payment, bank_transfer),
+
+                (
+                    current_pack,
+                    cash_payment,
+                    bank_transfer
+                )
             )
+
             sale_id = cursor.lastrowid
 
-            for _, name, amount in latest_staged:
+            for borrower in latest_borrowers:
+
+                _, name, amount = borrower
+
                 cursor.execute(
                     """
                     INSERT INTO pack_borrows
-                        (sale_id, borrower_name, borrow_amount, status)
+                    (
+                        sale_id,
+                        borrower_name,
+                        borrow_amount,
+                        status
+                    )
                     VALUES (?, ?, ?, 'Pending')
                     """,
-                    (sale_id, name, amount),
+
+                    (
+                        sale_id,
+                        name,
+                        amount
+                    )
                 )
 
             cursor.execute(
-                "DELETE FROM temp_staged_borrows WHERE pack_number = ?",
-                (current_pack,),
+                """
+                DELETE FROM temp_staged_borrows
+                WHERE pack_number = ?
+                """,
+
+                (current_pack,)
             )
+
             return sale_id
 
         try:
-            sale_id, sync_error = write_transaction(save_pack)
 
-            # Clear the two pack-entry values only after the transaction commits.
-            st.session_state["cash_pay_in"] = 0.0
-            st.session_state["bank_dep_in"] = 0.0
+            sale_id = write_transaction(
+                save_pack_transaction
+            )
 
-            if sync_error:
-                set_flash(
-                    f"Pack {current_pack} (Sale ID {sale_id}) was saved locally, "
-                    "but syncing with Turso failed. Check the connection before "
-                    "re-entering this pack.",
-                    "warning",
-                )
-            else:
-                set_flash(
-                    f"Pack {current_pack} saved and synced successfully!"
-                )
+            set_flash(
+                f"Pack {current_pack} saved successfully. "
+                "Turso synchronization is running in the background."
+            )
+
             st.rerun()
+
         except Exception as exc:
-            st.error(f"Could not save pack: {exc}")
+
+            st.error(
+                f"Could not save pack: {exc}"
+            )
 
 
 # ============================================================
 # 2. BANK DEPOSITS
 # ============================================================
+
 elif selected_section == "🏦 Bank Deposits":
+
     st.subheader("Make Standalone Bank Deposits")
 
-    with st.form("bank_deposit_form", clear_on_submit=True):
+    with st.form(
+        "bank_deposit_form",
+        clear_on_submit=True
+    ):
+
         deposit_type = st.selectbox(
             "Deposit Type",
+
             [
                 "Deposit Cash on Hand to Bank",
-                "Personal Money Investment to Bank",
-            ],
+
+                "Personal Money Investment to Bank"
+            ]
         )
+
         deposit_amount = st.number_input(
             "Amount (Rs.)",
             min_value=0.0,
-            step=100.0,
+            step=100.0
         )
-        deposit_notes = st.text_input("Notes / Description")
-        deposit_submitted = st.form_submit_button("Submit Deposit")
 
-    if deposit_submitted:
+        deposit_notes = st.text_input(
+            "Notes / Description"
+        )
+
+        submit_deposit = st.form_submit_button(
+            "Submit Deposit"
+        )
+
+    if submit_deposit:
+
         if deposit_amount <= 0:
-            st.error("Please enter a valid amount.")
+
+            st.error(
+                "Please enter a valid deposit amount."
+            )
+
         else:
-            def save_deposit(cursor):
+
+            def insert_deposit(cursor):
+
                 cursor.execute(
                     """
                     INSERT INTO bank_deposits
-                        (deposit_type, amount, notes)
+                    (
+                        deposit_type,
+                        amount,
+                        notes
+                    )
                     VALUES (?, ?, ?)
                     """,
-                    (deposit_type, deposit_amount, deposit_notes.strip()),
+
+                    (
+                        deposit_type,
+                        deposit_amount,
+                        deposit_notes.strip()
+                    )
                 )
 
             try:
-                _, sync_error = write_transaction(save_deposit)
-                show_write_result("Bank deposit recorded.", sync_error)
+
+                write_transaction(insert_deposit)
+
+                set_flash(
+                    "Bank deposit recorded successfully. "
+                    "Synchronizing in the background."
+                )
+
+                st.rerun()
+
             except Exception as exc:
-                st.error(f"Could not record bank deposit: {exc}")
+
+                st.error(
+                    f"Could not record deposit: {exc}"
+                )
 
 
 # ============================================================
 # 3. BANK EXPENSES
 # ============================================================
-elif selected_section == "💸 Bank Expenses":
-    st.subheader("Record Bank Account Expenses (Purchases)")
 
-    with st.form("bank_expense_form", clear_on_submit=True):
-        expense_description = st.text_input("Expense Description / Note")
+elif selected_section == "💸 Bank Expenses":
+
+    st.subheader(
+        "Record Bank Account Expenses (Purchases)"
+    )
+
+    with st.form(
+        "bank_expense_form",
+        clear_on_submit=True
+    ):
+
+        expense_description = st.text_input(
+            "Expense Description / Note"
+        )
+
         expense_amount = st.number_input(
             "Amount (Rs.)",
             min_value=0.0,
-            step=100.0,
+            step=100.0
         )
-        expense_submitted = st.form_submit_button("Submit Expense")
 
-    if expense_submitted:
+        submit_expense = st.form_submit_button(
+            "Submit Expense"
+        )
+
+    if submit_expense:
+
         if not expense_description.strip():
-            st.error("Please enter a description for the expense.")
+
+            st.error(
+                "Please enter an expense description."
+            )
+
         elif expense_amount <= 0:
-            st.error("Please enter a valid expense amount.")
+
+            st.error(
+                "Please enter a valid expense amount."
+            )
+
         else:
-            def save_expense(cursor):
+
+            def insert_expense(cursor):
+
                 cursor.execute(
                     """
                     INSERT INTO bank_expenses
-                        (expense_category, amount, notes)
+                    (
+                        expense_category,
+                        amount,
+                        notes
+                    )
                     VALUES (?, ?, ?)
                     """,
-                    ("Bank Expense", expense_amount, expense_description.strip()),
+
+                    (
+                        "Bank Expense",
+                        expense_amount,
+                        expense_description.strip()
+                    )
                 )
 
             try:
-                _, sync_error = write_transaction(save_expense)
-                show_write_result(
-                    "Bank expense recorded and balance updated.",
-                    sync_error,
+
+                write_transaction(insert_expense)
+
+                set_flash(
+                    "Bank expense recorded successfully. "
+                    "Synchronizing in the background."
                 )
+
+                st.rerun()
+
             except Exception as exc:
-                st.error(f"Could not record bank expense: {exc}")
+
+                st.error(
+                    f"Could not record expense: {exc}"
+                )
+
+    # --------------------------------------------------------
+    # EXPENSE HISTORY
+    # --------------------------------------------------------
 
     st.markdown("### Recent Bank Expenses History")
-    expense_rows = fetch_all(
+
+    expense_data = fetch_all(
         """
-        SELECT id, notes, amount, timestamp
+        SELECT
+            id,
+            notes,
+            amount,
+            timestamp
+
         FROM bank_expenses
+
         ORDER BY id DESC
+
         LIMIT 10
         """
     )
 
-    if expense_rows:
+    if expense_data:
+
+        expense_table = [
+
+            {
+                "ID": row[0],
+
+                "Expense Description": row[1],
+
+                "Amount": money(row[2]),
+
+                "Date/Time": row[3]
+            }
+
+            for row in expense_data
+
+        ]
+
         st.dataframe(
-            [
-                {
-                    "ID": row[0],
-                    "Expense Description": row[1],
-                    "Amount": money(row[2]),
-                    "Date/Time": row[3],
-                }
-                for row in expense_rows
-            ],
+            expense_table,
             use_container_width=True,
-            hide_index=True,
+            hide_index=True
         )
+
     else:
-        st.info("No bank expenses recorded yet.")
+
+        st.info(
+            "No bank expenses recorded yet."
+        )
 
 
 # ============================================================
 # 4. MANAGE DEBTS
 # ============================================================
+
 elif selected_section == "⚠️ Manage Debts":
-    st.subheader("Outstanding Customer Borrows")
+
+    st.subheader(
+        "Outstanding Customer Borrows"
+    )
 
     pending_debts = fetch_all(
         """
         SELECT
+
             pb.id,
+
             ps.pack_number,
+
             pb.borrower_name,
+
             pb.borrow_amount
-        FROM pack_borrows AS pb
-        INNER JOIN pack_sales AS ps ON pb.sale_id = ps.id
+
+        FROM pack_borrows pb
+
+        INNER JOIN pack_sales ps
+
+            ON pb.sale_id = ps.id
+
         WHERE pb.status = 'Pending'
+
         ORDER BY pb.id
         """
     )
 
     if pending_debts:
-        for debt_id, pack_number, borrower, amount in pending_debts:
-            col_customer, col_pack, col_amount, col_action = st.columns(
+
+        for debt in pending_debts:
+
+            debt_id, pack_number, borrower, amount = debt
+
+            cols = st.columns(
                 [3, 1.5, 2, 1.5]
             )
-            col_customer.write(f"**Customer:** {borrower}")
-            col_pack.write(f"Pack #{pack_number}")
-            col_amount.write(money(amount))
 
-            if col_action.button("Mark Paid", key=f"mark_paid_{debt_id}"):
-                def mark_debt_paid(cursor):
-                    # The status condition makes this operation idempotent:
-                    # a second click cannot mark or count the same debt twice.
+            cols[0].write(
+                f"**Customer:** {borrower}"
+            )
+
+            cols[1].write(
+                f"Pack #{pack_number}"
+            )
+
+            cols[2].write(
+                money(amount)
+            )
+
+            if cols[3].button(
+                "Mark Paid",
+                key=f"mark_paid_{debt_id}"
+            ):
+
+                def mark_paid(cursor):
+
                     cursor.execute(
                         """
                         UPDATE pack_borrows
+
                         SET status = 'Paid'
-                        WHERE id = ? AND status = 'Pending'
+
+                        WHERE id = ?
+
+                        AND status = 'Pending'
                         """,
-                        (debt_id,),
+
+                        (debt_id,)
                     )
+
                     return cursor.rowcount
 
                 try:
-                    updated_rows, sync_error = write_transaction(mark_debt_paid)
 
-                    if updated_rows:
-                        if sync_error:
-                            set_flash(
-                                f"Debt for {borrower} was marked paid locally, "
-                                "but Turso sync failed. Check the connection.",
-                                "warning",
-                            )
-                        else:
-                            set_flash(f"Cleared debt for {borrower}!")
-                    else:
+                    updated = write_transaction(
+                        mark_paid
+                    )
+
+                    if updated:
+
                         set_flash(
-                            f"This debt for {borrower} was already marked paid.",
-                            "warning",
+                            f"Cleared debt for {borrower}. "
+                            "Synchronizing in the background."
                         )
+
+                    else:
+
+                        set_flash(
+                            "This debt has already been marked as paid.",
+                            "warning"
+                        )
+
                     st.rerun()
+
                 except Exception as exc:
-                    st.error(f"Could not update payment status: {exc}")
+
+                    st.error(
+                        f"Could not update payment: {exc}"
+                    )
+
     else:
-        st.info("No pending customer debts found.")
+
+        st.info(
+            "No pending customer debts found."
+        )
 
 
 # ============================================================
 # 5. SALES HISTORY
 # ============================================================
+
 elif selected_section == "📊 Sales History":
-    st.subheader("Sales History (Grouped by Sets of 10 Packs)")
+
+    st.subheader(
+        "Sales History (Grouped by Sets of 10 Packs)"
+    )
 
     history_data = fetch_all(
         """
         SELECT
+
             ps.id,
+
             ps.pack_number,
+
             (
-                COALESCE(ps.cash_payment, 0) +
+                COALESCE(ps.cash_payment, 0)
+
+                +
+
                 COALESCE(
                     SUM(
                         CASE
@@ -725,7 +1282,9 @@ elif selected_section == "📊 Sales History":
                     0
                 )
             ) AS cash_received,
-            COALESCE(ps.cash_deposit, 0) AS bank_deposit,
+
+            COALESCE(ps.cash_deposit, 0),
+
             COALESCE(
                 SUM(
                     CASE
@@ -736,8 +1295,12 @@ elif selected_section == "📊 Sales History":
                 ),
                 0
             ) AS money_to_receive,
+
             (
-                COALESCE(ps.cash_payment, 0) +
+                COALESCE(ps.cash_payment, 0)
+
+                +
+
                 COALESCE(
                     SUM(
                         CASE
@@ -747,71 +1310,111 @@ elif selected_section == "📊 Sales History":
                         END
                     ),
                     0
-                ) +
+                )
+
+                +
+
                 COALESCE(ps.cash_deposit, 0)
             ) AS total_received
-        FROM pack_sales AS ps
-        LEFT JOIN pack_borrows AS pb ON ps.id = pb.sale_id
+
+        FROM pack_sales ps
+
+        LEFT JOIN pack_borrows pb
+
+            ON ps.id = pb.sale_id
+
         GROUP BY
+
             ps.id,
             ps.pack_number,
             ps.cash_payment,
             ps.cash_deposit
+
         ORDER BY ps.id ASC
         """
     )
 
     if history_data:
-        batches = OrderedDict()
+
+        batches = {}
 
         for index, row in enumerate(history_data):
+
             batch_number = (index // 10) + 1
-            first_pack = ((batch_number - 1) * 10) + 1
+
+            first_pack = (
+                (batch_number - 1) * 10
+            ) + 1
+
             last_pack = batch_number * 10
+
             batch_title = (
                 f"Packs {first_pack} to {last_pack} "
                 f"(Batch {batch_number})"
             )
-            batches.setdefault(batch_title, []).append(row)
 
-        # Display newest batch first, matching the previous dashboard.
+            if batch_title not in batches:
+
+                batches[batch_title] = []
+
+            batches[batch_title].append(row)
+
+        # Show the newest batch first.
         batch_items = list(batches.items())
+
         batch_items.reverse()
 
-        for batch_index, (batch_title, rows) in enumerate(batch_items):
+        for batch_index, (batch_title, rows) in enumerate(
+            batch_items
+        ):
+
             with st.expander(
                 batch_title,
-                expanded=(batch_index == 0),
+                expanded=(batch_index == 0)
             ):
+
                 table_rows = []
+
                 batch_total_received = 0.0
 
                 for row in rows:
-                    total_received = float(row[5] or 0)
-                    batch_total_received += total_received
+
+                    batch_total_received += float(
+                        row[5] or 0
+                    )
 
                     table_rows.append(
                         {
                             "Sale ID": row[0],
+
                             "Pack #": row[1],
+
                             "Cash Payment": money(row[2]),
+
                             "Bank Deposit": money(row[3]),
+
                             "Money to Receive": money(row[4]),
-                            "Total Received": money(row[5]),
+
+                            "Total Received": money(row[5])
                         }
                     )
 
                 st.dataframe(
                     table_rows,
                     use_container_width=True,
-                    hide_index=True,
+                    hide_index=True
                 )
+
                 st.markdown(
                     "**Total Received for this Group of Packs:** "
                     f"{money(batch_total_received)}"
                 )
+
     else:
-        st.info("No sales recorded yet.")
+
+        st.info(
+            "No sales recorded yet."
+        )
 
 
 # ============================================================
